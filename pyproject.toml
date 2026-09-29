@@ -6,4 +6,5 @@ dependencies = [
     "lightgbm>=4.7.0",
     "polars>=1.44.2",
     "pydantic>=2.13.5",
+    "typer>=0.27.2",
 ]
