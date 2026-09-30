@@ -1,5 +1,5 @@
 [project]
-name = "simple-example"
+name = "simple"
 version = "0.1.0"
 requires-python = ">=3.13"
 dependencies = [
@@ -10,4 +10,4 @@ dependencies = [
 repipe = { path = "../..", editable = true }
 
 [tool.repipe]
-main = "simple_example.py"
+main = "simple.py"
