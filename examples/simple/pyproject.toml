@@ -1,0 +1,13 @@
+[project]
+name = "simple-example"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "repipe",
+]
+
+[tool.uv.sources]
+repipe = { path = "../..", editable = true }
+
+[tool.repipe]
+main = "simple_example.py"
