@@ -7,7 +7,6 @@ from repipe.asset.asset import (
     Dependency,
     asset,
 )
-from repipe.asset.incremental import IncrementalSettings, IncrementalStrategy
 from repipe.asset.partition import PartitionSettings, PartitionType
 
 __all__ = [
@@ -17,8 +16,6 @@ __all__ = [
     "AssetReturnType",
     "AssetSettings",
     "Dependency",
-    "IncrementalSettings",
-    "IncrementalStrategy",
     "PartitionSettings",
     "PartitionType",
     "asset",
