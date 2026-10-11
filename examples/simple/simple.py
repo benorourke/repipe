@@ -1,12 +1,10 @@
-from importlib.metadata.diagnose import inspect
+from typing import AsyncIterator
 
 import polars as pl
 
-from repipe.asset.asset import asset, AssetContext
-from repipe.asset.incremental import IncrementalStrategy, IncrementalSettings
-from lightgbm import LGBMClassifier
-
 from repipe import Repipe
+from repipe.asset.asset import asset, AssetContext
+from repipe.storage import Mode, ParquetStorageConfig
 from repipe.testing.data_quality import data_quality_test, TestResult
 
 
@@ -15,6 +13,7 @@ def my_data_quality_test() -> TestResult:
     return TestResult(
         success=False
     )
+
 
 @asset(
     dependencies=[],
@@ -30,20 +29,23 @@ def my_asset(
         }
     ).lazy()
 
+
 @asset(
-    dependencies=["my_asset"],
+    dependencies=["my_downstream_asset", "my_asset"],
     schemas=["intermediate"],
-    incremental=IncrementalSettings(
-        date_column='test_date',
-        primary_key='test_column',
-        strategy=IncrementalStrategy.UPSERT
-    ),
+    storage=ParquetStorageConfig(mode=Mode.APPEND_THEN_MERGE),
+    primary_key="column_a",
 )
-def my_downstream_asset(
+async def my_downstream_asset(
         context: AssetContext,
+        my_downstream_asset: pl.LazyFrame | None,
         my_asset: pl.LazyFrame,
-) -> pl.LazyFrame:
-    return pl.concat([my_asset, my_asset])
+) -> AsyncIterator[pl.DataFrame]:
+
+    """ Streams chunks, each written as its own part file, then merged by the mode above. """
+    for chunk in pl.concat([my_asset, my_asset]).collect().iter_slices(n_rows=5):
+        yield chunk
+
 
 @asset(
     dependencies=[
@@ -57,8 +59,12 @@ def my_downstream_asset(
 def my_lgbm_asset(
         context: AssetContext,
         my_downstream_asset: pl.LazyFrame,
-) -> LGBMClassifier:
+) -> pl.LazyFrame:
+    # TODO: `storage.save()` doesn't yet support persisting a real LGBMReturnType (only
+    # DataFrame/LazyFrame) - returning one here would crash at materialization time, so this
+    # stays a LazyFrame until that's built out.
     return my_downstream_asset.first()
+
 
 app = Repipe(
     assets=[

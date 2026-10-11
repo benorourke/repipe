@@ -12,7 +12,6 @@ class NodeKind(StrEnum):
     ASSET = "asset"
     TEST = "test"
 
-# TODO: make this allow for either {test_name} or {asset_name}::{test_name}
 
 class GraphNode(BaseModel):
     """ A single selectable unit in the combined asset/test graph. """
@@ -51,7 +50,7 @@ def build_graph(assets: Mapping[str, Asset]) -> dict[str, GraphNode]:
             id=asset_name,
             kind=NodeKind.ASSET,
             name=asset_name,
-            upstream=frozenset(manifest.settings.dependency_names),
+            upstream=frozenset(manifest.settings.dependency_names) - {asset_name},
             labels=labels,
             obj=manifest,
         )

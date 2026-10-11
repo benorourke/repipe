@@ -5,6 +5,7 @@ from repipe.asset.asset import (
     AssetReturnType,
     AssetSettings,
     Dependency,
+    PrimaryKey,
     asset,
 )
 from repipe.asset.partition import PartitionSettings, PartitionType
@@ -18,5 +19,6 @@ __all__ = [
     "Dependency",
     "PartitionSettings",
     "PartitionType",
+    "PrimaryKey",
     "asset",
 ]

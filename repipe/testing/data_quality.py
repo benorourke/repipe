@@ -1,10 +1,8 @@
 import functools
 from enum import StrEnum
-from typing import Callable, Any, cast
+from typing import Any, Callable, cast, overload
 
 from pydantic import BaseModel
-
-type _TestInput = Any
 
 
 class FailType(StrEnum):
@@ -19,7 +17,7 @@ class TestResult(BaseModel):
     success: bool = False
 
 
-type DataQualityTest = Callable[[_TestInput], TestResult]
+type DataQualityTest = Callable[..., TestResult]
 
 
 class RegisteredDataQualityTest(BaseModel):
@@ -31,11 +29,20 @@ class RegisteredDataQualityTest(BaseModel):
     fail_type: FailType
 
 
+@overload
+def data_quality_test(func: DataQualityTest) -> DataQualityTest: ...
+
+
+@overload
+def data_quality_test(func: None = None, *, fail_type: FailType = FailType.FAIL) -> Callable[
+    [DataQualityTest], DataQualityTest]: ...
+
+
 def data_quality_test(
         func: DataQualityTest | None = None,
         *,
         fail_type: FailType = FailType.FAIL
-):
+) -> DataQualityTest | Callable[[DataQualityTest], DataQualityTest]:
     """ Supports both bare `@data_quality_test` and parameterized `@data_quality_test(...)` usage. """
 
     def decorator(inner_func: DataQualityTest) -> DataQualityTest:
