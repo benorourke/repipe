@@ -22,8 +22,12 @@ build-backend = "setuptools.build_meta"
 
 [dependency-groups]
 dev = [
+    "pyright>=1.1.414",
     "pytest>=9.1.1",
 ]
 
 [tool.setuptools.packages.find]
 include = ["repipe*"]
+
+[tool.pyright]
+exclude = ["build"]
