@@ -3,7 +3,7 @@ from lightgbm import LGBMClassifier
 from sklearn.datasets import load_iris
 
 from repipe import Repipe
-from repipe.asset.asset import asset, AssetContext
+from repipe.asset import AssetContext, AssetOut, PartitionSettings, asset, multi_asset
 from repipe.storage import LGBMStorageConfig
 
 
@@ -16,7 +16,11 @@ def iris_raw(context: AssetContext) -> pl.DataFrame:
     )
 
 
-@asset(dependencies=["iris_raw"], schemas=["intermediate"])
+@asset(
+    dependencies=["iris_raw"],
+    schemas=["intermediate"],
+    partition=PartitionSettings(columns={"species": pl.Int64}),
+)
 def iris_renamed(context: AssetContext, iris_raw: pl.DataFrame) -> pl.DataFrame:
     """ Step 2: rename the columns to something friendlier than sklearn's defaults. """
     return iris_raw.rename({
@@ -28,17 +32,31 @@ def iris_renamed(context: AssetContext, iris_raw: pl.DataFrame) -> pl.DataFrame:
     })
 
 
-@asset(
+@multi_asset(
+    outputs={
+        "iris_train": AssetOut(schemas=["intermediate"]),
+        "iris_test": AssetOut(schemas=["intermediate"]),
+    },
     dependencies=["iris_renamed"],
+)
+def iris_split(context: AssetContext, iris_renamed: pl.DataFrame) -> dict[str, pl.DataFrame]:
+    """ Step 3: hold back a fifth of the rows for testing. """
+    shuffled = iris_renamed.sample(fraction=1.0, shuffle=True, seed=0)
+    train_rows = len(shuffled) * 4 // 5
+    return {"iris_train": shuffled.head(train_rows), "iris_test": shuffled.tail(-train_rows)}
+
+
+@asset(
+    dependencies=["iris_train"],
     schemas=["mart"],
     storage=LGBMStorageConfig(),
 )
-def iris_model(context: AssetContext, iris_renamed: pl.DataFrame) -> LGBMClassifier:
-    """ Step 3: train an LGBM model on the renamed iris data. """
+def iris_model(context: AssetContext, iris_train: pl.DataFrame) -> LGBMClassifier:
+    """ Step 4: train an LGBM model on the training rows. """
     model = LGBMClassifier(n_estimators=10, verbose=-1)
     model.fit(
-        iris_renamed.select("sepal_length", "sepal_width", "petal_length", "petal_width"),
-        iris_renamed["species"],
+        iris_train.select("sepal_length", "sepal_width", "petal_length", "petal_width"),
+        iris_train["species"],
     )
     return model
 
@@ -47,6 +65,7 @@ app = Repipe(
     assets=[
         iris_raw,
         iris_renamed,
+        iris_split,
         iris_model,
     ]
 )

@@ -8,7 +8,7 @@ from typing import Callable, Mapping
 from frozendict import frozendict
 from pydantic import BaseModel
 
-from repipe.asset.asset import RegisteredAsset, Asset
+from repipe.asset.asset import Asset, AssetFunction, RegisteredAssetFunction
 
 
 class Repipe:
@@ -33,18 +33,26 @@ class Repipe:
     ) -> dict[str, Asset]:
         assets: dict[str, Asset] = {}
         for asset_func in asset_functions:
-            registered: RegisteredAsset = getattr(asset_func, "__asset__")
-            asset_name = registered.name
-            assets[asset_name] = Asset(
-                # TODO - unit test that we're setting all values here it's a bit of a trip hazard. Or move the constructor elsewhere
-                name=asset_name,
-                base_storage_path=base_storage_path,
-                settings=registered.settings,
+            registered: RegisteredAssetFunction = getattr(asset_func, "__asset__")
+            function = AssetFunction(
+                name=registered.name,
                 func=registered.func,
+                dependencies=registered.dependencies,
+                outputs=list(registered.outputs),
+                is_multi=registered.is_multi,
+                python_func=registered.func.__name__,
                 python_module=asset_func.__module__,
                 python_file=sys.modules[asset_func.__module__].__file__ or "",
-                python_func=registered.func.__name__,
             )
+            for asset_name, settings in registered.outputs.items():
+                if asset_name in assets:
+                    raise ValueError(f"two assets are named {asset_name!r} - asset names must be unique")
+                assets[asset_name] = Asset(
+                    name=asset_name,
+                    base_storage_path=base_storage_path,
+                    settings=settings,
+                    function=function,
+                )
         return assets
 
     @staticmethod

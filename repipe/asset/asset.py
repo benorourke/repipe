@@ -2,9 +2,9 @@ import functools
 import inspect
 import types
 import typing
-from functools import cached_property
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Coroutine, Iterable, Iterator, Sequence, cast, overload
+from typing import Any, AsyncIterator, Callable, Coroutine, Iterable, Iterator, Mapping, Sequence, cast, overload
 
 import duckdb
 import polars as pl
@@ -23,9 +23,21 @@ from repipe.storage import (
 from repipe.testing.data_quality import DataQualityTest
 
 type AssetChunk = pl.DataFrame
+type AssetData = AssetChunk | pl.LazyFrame | LGBMReturnType | duckdb.DuckDBPyRelation
+
+
+@dataclass(frozen=True)
+class Output:
+    """ An explicit write, for what returning or yielding plain data can't say: which output of
+    a multi-asset it's for, or a partition key that isn't in the data (e.g. one model per partition). """
+    data: AssetData
+    asset: str | None = None
+    partition: Mapping[str, Any] | None = None
+
+
 type AssetReturnType = (
-    AssetChunk | pl.LazyFrame | LGBMReturnType | duckdb.DuckDBPyRelation
-    | Iterator[AssetChunk] | AsyncIterator[AssetChunk]
+    AssetData | Output | Mapping[str, AssetData]
+    | Iterator[AssetChunk | Output] | AsyncIterator[AssetChunk | Output]
 )
 type PrimaryKey = str | pl.Expr | Sequence[str] | Sequence[pl.Expr]
 
@@ -37,20 +49,16 @@ class Dependency(BaseModel):
 
 
 class AssetSettings(BaseModel):
-    """ Bundle of the kwargs rom the asset decorator """
+    """ The per-output kwargs of `@asset`/`AssetOut`. """
     model_config = {"arbitrary_types_allowed": True}
 
     storage: StorageConfig
     primary_key: PrimaryKey | None = None
-    dependencies: dict[str, Dependency]
     schemas: list[str] | None = None
     labels: frozenset[str] = frozenset()
     partition: PartitionSettings | None = None
     tests: Sequence[DataQualityTest] | None = None
-
-    @cached_property
-    def dependency_names(self) -> list[str]:
-        return list(self.dependencies.keys())
+    is_required: bool = True
 
     @field_validator("primary_key", mode="before")
     @classmethod
@@ -76,6 +84,31 @@ class AssetSettings(BaseModel):
             raise ValueError("primary_key has no meaning for LGBMStorageConfig - a model has no rows to key by")
         return self
 
+    @model_validator(mode="after")
+    def _check_overwrite_by_needs_overwrite(self) -> "AssetSettings":
+        if self.partition and self.partition.overwrite_by and self.storage.mode != Mode.OVERWRITE:
+            raise ValueError(f"overwrite_by only applies to Mode.OVERWRITE, but storage.mode={self.storage.mode!r}")
+        return self
+
+
+class AssetFunction(BaseModel):
+    """ A decorated function. Produces one asset, or several for `@multi_asset`. """
+    model_config = {"arbitrary_types_allowed": True}
+
+    name: str
+    func: Callable
+    dependencies: dict[str, Dependency]
+    outputs: list[str]
+    is_multi: bool
+
+    python_func: str
+    python_module: str
+    python_file: str
+
+    @property
+    def dependency_names(self) -> list[str]:
+        return list(self.dependencies.keys())
+
 
 class Asset(BaseModel):
     model_config = {"arbitrary_types_allowed": True}
@@ -86,10 +119,23 @@ class Asset(BaseModel):
 
     settings: AssetSettings
 
-    func: Callable
-    python_func: str
-    python_module: str
-    python_file: str
+    function: AssetFunction
+
+    @property
+    def func(self) -> Callable:
+        return self.function.func
+
+    @property
+    def python_func(self) -> str:
+        return self.function.python_func
+
+    @property
+    def python_module(self) -> str:
+        return self.function.python_module
+
+    @property
+    def python_file(self) -> str:
+        return self.function.python_file
 
     @property
     def schemas(self) -> list[str] | None:
@@ -112,15 +158,32 @@ class AssetContext(BaseModel):
 type AssetFunc = Callable[..., AssetReturnType | Coroutine[Any, Any, AssetReturnType]]
 
 
-class RegisteredAsset(BaseModel):
-    """
-    Pairs a decorated function with the settings it was declared with. Set against the inner decorator function.
-    """
+class RegisteredAssetFunction(BaseModel):
+    """ What `@asset`/`@multi_asset` set as `__asset__` on the function they decorate. """
     model_config = {"arbitrary_types_allowed": True}
 
     name: str
     func: AssetFunc
-    settings: AssetSettings
+    dependencies: dict[str, Dependency]
+    outputs: dict[str, AssetSettings]
+    is_multi: bool
+
+    @property
+    def dependency_names(self) -> list[str]:
+        return list(self.dependencies.keys())
+
+
+@dataclass(frozen=True, kw_only=True)
+class AssetOut:
+    """ One output of a `@multi_asset`, taking the same per-output settings as `@asset`. """
+    storage: StorageType | StorageConfig = StorageType.PARQUET
+    primary_key: PrimaryKey | None = None
+    schemas: list[str] | None = None
+    labels: Sequence[str] = field(default_factory=list)
+    partition: PartitionSettings | None = None
+    tests: Sequence[DataQualityTest] | None = None
+    is_required: bool = True
+    """ A required output the function doesn't write fails the run. An optional one is left as it was. """
 
 
 @overload
@@ -156,31 +219,11 @@ def asset(
     above exist only so a type checker picks the right return type for each form. """
 
     def decorator(inner_func: AssetFunc) -> AssetFunc:
-        resolved_storage = storage if isinstance(storage, BaseStorageConfig) else make_default_storage_config(storage)
-        _check_self_reference(inner_func, _coerce_dependencies(dependencies))
-        resolved_storage.check_compatible(inner_func)
-        settings = AssetSettings(
-            storage=resolved_storage,
-            primary_key=primary_key,
-            schemas=schemas,
-            dependencies=_coerce_dependencies(dependencies),
-            labels=frozenset(labels or []),
-            partition=partition,
-            tests=tests,
+        output = AssetOut(
+            storage=storage, primary_key=primary_key, schemas=schemas, labels=labels or [],
+            partition=partition, tests=tests,
         )
-
-        @functools.wraps(inner_func)
-        def inner(*args, **kwargs):
-            return inner_func(*args, **kwargs)
-
-        registered = RegisteredAsset(
-            name=inner_func.__name__,
-            func=inner_func,
-            settings=settings,
-        )
-        cast(Any, inner).__asset__ = registered
-
-        return inner
+        return _register(inner_func, {inner_func.__name__: output}, dependencies, labels=[], is_multi=False)
 
     if func is not None:
         return decorator(func)
@@ -188,11 +231,71 @@ def asset(
     return decorator
 
 
-def _check_self_reference(inner_func: AssetFunc, dependencies: dict[str, Dependency]) -> None:
+def multi_asset(
+        *,
+        outputs: dict[str, AssetOut],
+        dependencies: list[str] | list[Dependency] | None = None,
+        labels: Sequence[str] | None = None,
+) -> Callable[[AssetFunc], AssetFunc]:
+    """ One function producing several assets. It returns a `dict` keyed by output name, or
+    yields `Output(data, asset=name)`. Selecting any of its outputs runs it and writes all of
+    them. `labels` apply to every output. """
+
+    def decorator(inner_func: AssetFunc) -> AssetFunc:
+        if not outputs:
+            raise ValueError(f"multi_asset {inner_func.__name__!r} must declare at least one output")
+        return _register(inner_func, outputs, dependencies, labels=labels or [], is_multi=True)
+
+    return decorator
+
+
+def _register(
+        inner_func: AssetFunc,
+        outputs: dict[str, AssetOut],
+        dependencies: list[str] | list[Dependency] | None,
+        labels: Sequence[str],
+        is_multi: bool,
+) -> AssetFunc:
+    coerced_dependencies = _coerce_dependencies(dependencies)
+    _check_self_references(inner_func, list(outputs), coerced_dependencies)
+
+    settings = {}
+    for name, output in outputs.items():
+        storage = output.storage
+        resolved_storage = storage if isinstance(storage, BaseStorageConfig) else make_default_storage_config(storage)
+        resolved_storage.check_compatible(inner_func, output.partition)
+        settings[name] = AssetSettings(
+            storage=resolved_storage,
+            primary_key=output.primary_key,
+            schemas=output.schemas,
+            labels=frozenset([*output.labels, *labels]),
+            partition=output.partition,
+            tests=output.tests,
+            is_required=output.is_required,
+        )
+
+    @functools.wraps(inner_func)
+    def inner(*args, **kwargs):
+        return inner_func(*args, **kwargs)
+
+    cast(Any, inner).__asset__ = RegisteredAssetFunction(
+        name=inner_func.__name__,
+        func=inner_func,
+        dependencies=coerced_dependencies,
+        outputs=settings,
+        is_multi=is_multi,
+    )
+    return inner
+
+
+def _check_self_references(inner_func: AssetFunc, output_names: list[str], dependencies: dict[str, Dependency]) -> None:
     """ An asset can depend on itself, but if it does, the kwarg type must be optional (e.g. accept None).
     If it has not been materialized yet, None will be passed in. This is checked at run/registration time."""
-    name = inner_func.__name__
+    for name in output_names:
+        _check_self_reference(inner_func, name, dependencies)
 
+
+def _check_self_reference(inner_func: AssetFunc, name: str, dependencies: dict[str, Dependency]) -> None:
     parameter = inspect.signature(inner_func).parameters.get(name)
     if parameter is None:
         return
