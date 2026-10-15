@@ -1,37 +1,34 @@
-∂from __future__ import annotations
+from __future__ import annotations
 
 import abc
 import enum
+import inspect
 import itertools
+import pickle
 import shutil
 import uuid
 from abc import abstractmethod
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, Callable, cast, overload
 
 import polars as pl
-from pydantic import BaseModel
+from lightgbm import LGBMClassifier, LGBMRanker, LGBMRegressor
+from pydantic import BaseModel, model_validator
 
 if TYPE_CHECKING:
     from repipe.asset.asset import Asset
+
+type LGBMReturnType = LGBMClassifier | LGBMRegressor | LGBMRanker
 
 
 class StorageType(enum.StrEnum):
     CSV = "CSV"
     PARQUET = "PARQUET"
     ARROW = "ARROW"
+    LGBM = "LGBM"
 
 
 class Mode(enum.StrEnum):
-    """ Governs what happens to an asset's part files on each `materialize()`.
-
-    Storage is a directory of part files, not one file, and a part is always one of two
-    kinds: pending (`run-{run_id}-part-{n}`), written directly by `save` - one per
-    `materialize()` chunk - and (`part-{n}`), written only by `consolidate()`, which
-    reads every existing part (pending or canonical), dedupes/comp∂acts them, and replaces them
-    all with a fresh canonical set. `load` globs every part, pending or canonical, into one
-    `LazyFrame` regardless of mode - consolidation is an optimization, not something a reader
-    needs to wait for. """
 
     OVERWRITE = "overwrite"
     """ After this run's new part(s) write successfully, deletes every part - pending or
@@ -59,6 +56,9 @@ class BaseStorageConfig(BaseModel):
     """ Caps each file `consolidate()` writes to, via polars' native partitioned sink.
         `None` (default) merges everything into a single file instead. """
 
+    def check_compatible(self, inner_func: Callable[..., Any]) -> None:
+        """ Hook for a storage backend to reject an asset function shape it can't represent. """
+
 
 class ParquetStorageConfig(BaseStorageConfig):
     pass
@@ -72,7 +72,31 @@ class CsvStorageConfig(BaseStorageConfig):
     pass
 
 
-type StorageConfig = ParquetStorageConfig | ArrowStorageConfig | CsvStorageConfig
+class LGBMStorageConfig(BaseStorageConfig):
+    """ A trained model has no rows, so none of `BaseStorageConfig`'s part-compaction fields apply. """
+
+    @model_validator(mode="after")
+    def _check_fields_are_compatible_with_a_model(self) -> "LGBMStorageConfig":
+        if self.mode != Mode.OVERWRITE:
+            raise ValueError(
+                f"LGBMStorageConfig only supports Mode.OVERWRITE, got {self.mode!r} - "
+                f"a model has no parts to append or merge"
+            )
+        if self.is_duplicate is not None:
+            raise ValueError("LGBMStorageConfig doesn't support is_duplicate - a model has no rows to dedupe")
+        if self.max_rows_per_file is not None:
+            raise ValueError("LGBMStorageConfig doesn't support max_rows_per_file - a model isn't rows")
+        return self
+
+    def check_compatible(self, inner_func: Callable[..., Any]) -> None:
+        if inspect.isgeneratorfunction(inner_func) or inspect.isasyncgenfunction(inner_func):
+            raise ValueError(
+                f"asset {inner_func.__name__!r} is a generator but uses LGBMStorageConfig - "
+                f"a trained model has no per-chunk parts to write; return a single model instead"
+            )
+
+
+type StorageConfig = ParquetStorageConfig | ArrowStorageConfig | CsvStorageConfig | LGBMStorageConfig
 
 
 def make_default_storage_config(storage_type: StorageType) -> StorageConfig:
@@ -83,6 +107,8 @@ def make_default_storage_config(storage_type: StorageType) -> StorageConfig:
             return ArrowStorageConfig()
         case StorageType.CSV:
             return CsvStorageConfig()
+        case StorageType.LGBM:
+            return LGBMStorageConfig()
         case _:
             raise NotImplementedError()
 
@@ -133,6 +159,9 @@ class StorageConcrete[LoadType, SaveType, ConfigType](
         """ Compacts (and, per `config`, dedupes) every part file, per `config.max_rows_per_file`. """
         raise NotImplementedError()
 
+    def asset_dir(self, asset: Asset) -> Path:
+        return asset.base_storage_path_with_schema / asset.name
+
 
 class PolarsPartitionedStorage[ConfigType](
     StorageConcrete[pl.LazyFrame, pl.DataFrame | pl.LazyFrame, ConfigType]
@@ -157,9 +186,6 @@ class PolarsPartitionedStorage[ConfigType](
     @abstractmethod
     def sink(self, lf: pl.LazyFrame, path: Path | pl.PartitionBy) -> None:
         raise NotImplementedError()
-
-    def asset_dir(self, asset: Asset) -> Path:
-        return asset.base_storage_path_with_schema / asset.name
 
     def part_glob(self, asset: Asset) -> Path:
         return self.asset_dir(asset) / f"*.{self.extension}"
@@ -191,6 +217,12 @@ class PolarsPartitionedStorage[ConfigType](
             self, config: ConfigType, asset: Asset, obj: pl.DataFrame | pl.LazyFrame,
             run_id: str, part_number: int,
     ) -> None:
+        if not isinstance(obj, (pl.DataFrame, pl.LazyFrame)):
+            raise TypeError(
+                f"asset {asset.name!r} returned {type(obj).__name__!r}, but its storage "
+                f"({type(self).__name__!r}) only persists a polars DataFrame/LazyFrame"
+            )
+
         directory = self.asset_dir(asset)
         directory.mkdir(parents=True, exist_ok=True)
         staged_path = directory / self._pending_staged_name(run_id, part_number)
@@ -215,8 +247,6 @@ class PolarsPartitionedStorage[ConfigType](
         if not old_parts:
             return
 
-        # `part-*` (canonical) sorts before `run-*` (pending) alphabetically, which is
-        # correct here: canonical is always older than anything currently pending.
         frame = pl.concat([self.scan(part) for part in old_parts])
         base_config = cast(BaseStorageConfig, config)
         primary_key = asset.settings.primary_key
@@ -225,17 +255,10 @@ class PolarsPartitionedStorage[ConfigType](
         if base_config.is_duplicate is not None:
             frame = frame.filter(~base_config.is_duplicate)
 
-        # Discard any `.tmp` orphaned by a previously failed consolidate - always safe,
-        # since a lingering `.tmp` means its generation never finished phase 1 below, so
-        # nothing depends on it; the data it would have replaced is still intact under its
-        # own name and was just re-read into `frame` above as part of `old_parts`.
+        # Discard any `.tmp` orphaned by a previously failed consolidate
         for stray in directory.glob(f"part-*.{self.extension}.tmp"):
             stray.unlink()
 
-        # Every file this call writes is tagged with a fresh, unique generation id, so
-        # writing/staging it can never collide with (and thus never destroy) anything that
-        # already exists - only the final rename in phase 2 below does that, once the data
-        # is already safely visible elsewhere.
         generation = uuid.uuid4().hex[:8]
 
         def generation_staged_name(number: int) -> str:
@@ -332,21 +355,96 @@ class CsvPolars(PolarsPartitionedStorage[CsvStorageConfig]):
         return CsvStorageConfig
 
 
+# LGBM
+class LGBMModelStorage(StorageConcrete[LGBMReturnType, LGBMReturnType, LGBMStorageConfig]):
+    """ A single trained model per asset, not a directory of rows - but the same pending-name
+    `.tmp`-then-rename atomicity. `Mode.OVERWRITE` is the only mode `LGBMStorageConfig` allows. """
+
+    def _pending_name(self, run_id: str) -> str:
+        return f"run-{run_id}-model.pkl"
+
+    def _pending_staged_name(self, run_id: str) -> str:
+        return f"{self._pending_name(run_id)}.tmp"
+
+    @property
+    def config_type(self) -> type[LGBMStorageConfig]:
+        return LGBMStorageConfig
+
+    def clear(self, asset: Asset) -> None:
+        shutil.rmtree(self.asset_dir(asset), ignore_errors=True)
+
+    def existing_parts(self, asset: Asset) -> set[Path]:
+        directory = self.asset_dir(asset)
+        return set(directory.glob("*.pkl")) if directory.exists() else set()
+
+    def save(
+            self, config: LGBMStorageConfig, asset: Asset, obj: LGBMReturnType,
+            run_id: str, part_number: int,
+    ) -> None:
+        if not isinstance(obj, (LGBMClassifier, LGBMRegressor, LGBMRanker)):
+            raise TypeError(
+                f"asset {asset.name!r} returned {type(obj).__name__!r}, but its storage "
+                f"(LGBMModelStorage) only persists a trained LGBM model"
+            )
+
+        directory = self.asset_dir(asset)
+        directory.mkdir(parents=True, exist_ok=True)
+        staged_path = directory / self._pending_staged_name(run_id)
+
+        with staged_path.open("wb") as file:
+            pickle.dump(obj, file)
+
+        staged_path.rename(directory / self._pending_name(run_id))
+
+    def load(self, config: LGBMStorageConfig, asset: Asset) -> LGBMReturnType:
+        parts = sorted(self.existing_parts(asset))
+        if not parts:
+            raise FileNotFoundError(f"no model has been written yet for asset {asset.name!r}")
+        with parts[-1].open("rb") as file:
+            return pickle.load(file)
+
+    def load_previous(self, config: LGBMStorageConfig, asset: Asset) -> LGBMReturnType | None:
+        parts = sorted(self.existing_parts(asset))
+        if not parts:
+            return None
+        with parts[-1].open("rb") as file:
+            return pickle.load(file)
+
+    def consolidate(self, config: LGBMStorageConfig, asset: Asset) -> None:
+        raise NotImplementedError(
+            "a model has no parts to compact - LGBMStorageConfig only supports Mode.OVERWRITE, "
+            "which never calls consolidate()"
+        )
+
+
 STORAGE_TYPE_MAPPINGS = {
     StorageType.PARQUET: ParquetPolars,
     StorageType.ARROW: ArrowPolars,
     StorageType.CSV: CsvPolars,
+    StorageType.LGBM: LGBMModelStorage,
 }
 
 CONFIG_TYPE_MAPPINGS = {
     ParquetStorageConfig: StorageType.PARQUET,
     ArrowStorageConfig: StorageType.ARROW,
     CsvStorageConfig: StorageType.CSV,
+    LGBMStorageConfig: StorageType.LGBM,
 }
 
 
-def get_storage_concrete(config: StorageConfig) -> PolarsPartitionedStorage:
-    """ Resolve the StorageConcrete implementation that handles this config. """
+@overload
+def get_storage_concrete(config: ParquetStorageConfig) -> ParquetPolars: ...
+@overload
+def get_storage_concrete(config: ArrowStorageConfig) -> ArrowPolars: ...
+@overload
+def get_storage_concrete(config: CsvStorageConfig) -> CsvPolars: ...
+@overload
+def get_storage_concrete(config: LGBMStorageConfig) -> LGBMModelStorage: ...
+@overload
+def get_storage_concrete(config: StorageConfig) -> StorageConcrete[Any, Any, Any]: ...
+
+
+def get_storage_concrete(config: StorageConfig) -> StorageConcrete[Any, Any, Any]:
     storage_type = CONFIG_TYPE_MAPPINGS[type(config)]
     return STORAGE_TYPE_MAPPINGS[storage_type]()
 
