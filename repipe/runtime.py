@@ -1,8 +1,11 @@
 import inspect
 import itertools
+import types
+import typing
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Iterator, cast
 
+import duckdb
 from pydantic import BaseModel
 
 from repipe.asset.asset import Asset, AssetContext, AssetReturnType
@@ -83,15 +86,23 @@ async def materialize(
     storage_config = asset.settings.storage
     storage = get_storage_concrete(storage_config)
 
+    parameters = inspect.signature(asset.func).parameters
+    try:
+        annotations = typing.get_type_hints(asset.func)
+    except Exception:  # unresolvable forward reference - fall back to the raw annotations
+        annotations = {}
+
     kwargs: dict[str, Any] = {}
-    for param_name in inspect.signature(asset.func).parameters:
+    for param_name in parameters:
+        annotation = annotations.get(param_name, parameters[param_name].annotation)
         if param_name == "context":
             kwargs[param_name] = context
         elif param_name == asset.name:
             # Its own previous output (None on the first run) - snapshotted here, before any write.
-            kwargs[param_name] = storage.load_previous(storage_config, asset)
+            previous = storage.load_previous(storage_config, asset)
+            kwargs[param_name] = _as_duckdb_relation_if_annotated(previous, annotation)
         else:
-            kwargs[param_name] = _resolve_dependency(param_name, graph, results)
+            kwargs[param_name] = _resolve_dependency(param_name, graph, results, annotation)
     func = asset.func
 
     # Snapshot stale parts for deletion once generating is complete
@@ -103,17 +114,18 @@ async def materialize(
         chunks: AsyncIterator[Any] = func(**kwargs)
         part_number = 1
         async for chunk in chunks:
-            storage.save(storage_config, asset, chunk, run_id, part_number)
+            storage.save(storage_config, asset, _duckdb_relation_to_polars(chunk), run_id, part_number)
             part_number += 1
         results[asset.name] = storage.load(storage_config, asset)
     elif inspect.isgeneratorfunction(func):
         part_number = 1
         for chunk in func(**kwargs):
-            storage.save(storage_config, asset, chunk, run_id, part_number)
+            storage.save(storage_config, asset, _duckdb_relation_to_polars(chunk), run_id, part_number)
             part_number += 1
         results[asset.name] = storage.load(storage_config, asset)
     else:
         result = await func(**kwargs) if inspect.iscoroutinefunction(func) else func(**kwargs)
+        result = _duckdb_relation_to_polars(result)
         storage.save(storage_config, asset, result, run_id, 1)
         results[asset.name] = result
 
@@ -130,16 +142,40 @@ def _resolve_dependency(
         name: str,
         graph: dict[str, GraphNode],
         results: dict[str, AssetReturnType],
-) -> AssetReturnType:
+        annotation: object,
+) -> Any:
     if name in results:
-        return results[name]
+        value = results[name]
+    else:
+        node = graph.get(name)
+        if node is None or node.kind != NodeKind.ASSET:
+            raise ValueError(f"{name!r} is not a known asset - check its @asset dependencies/parameters")
 
-    node = graph.get(name)
-    if node is None or node.kind != NodeKind.ASSET:
-        raise ValueError(f"{name!r} is not a known asset - check its @asset dependencies/parameters")
+        upstream = cast(Asset, node.obj)
+        value = get_storage_concrete(upstream.settings.storage).load(upstream.settings.storage, upstream)
 
-    upstream = cast(Asset, node.obj)
-    return get_storage_concrete(upstream.settings.storage).load(upstream.settings.storage, upstream)
+    return _as_duckdb_relation_if_annotated(value, annotation)
+
+
+def _duckdb_relation_to_polars(obj: Any) -> Any:
+    return obj.pl() if isinstance(obj, duckdb.DuckDBPyRelation) else obj
+
+
+def _as_duckdb_relation_if_annotated(value: Any, annotation: object) -> Any:
+    if value is None or not _allows_duckdb_relation(annotation):
+        return value
+
+    con = duckdb.connect()
+    con.register("value", value)
+    return con.table("value")
+
+
+def _allows_duckdb_relation(annotation: object) -> bool:
+    if annotation is duckdb.DuckDBPyRelation:
+        return True
+    if typing.get_origin(annotation) in (typing.Union, types.UnionType):
+        return any(_allows_duckdb_relation(arg) for arg in typing.get_args(annotation))
+    return False
 
 
 def run_test(test_id: str, test: RegisteredDataQualityTest) -> None:

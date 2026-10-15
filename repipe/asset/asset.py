@@ -6,17 +6,27 @@ from functools import cached_property
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Coroutine, Iterable, Iterator, Sequence, cast, overload
 
+import duckdb
 import polars as pl
-from lightgbm import LGBMClassifier, LGBMRegressor, LGBMRanker
 from pydantic import BaseModel, field_validator, model_validator
 
 from repipe.asset.partition import PartitionSettings
-from repipe.storage import BaseStorageConfig, Mode, StorageType, StorageConfig, make_default_storage_config
+from repipe.storage import (
+    BaseStorageConfig,
+    LGBMReturnType,
+    LGBMStorageConfig,
+    Mode,
+    StorageType,
+    StorageConfig,
+    make_default_storage_config,
+)
 from repipe.testing.data_quality import DataQualityTest
 
-type LGBMReturnType = LGBMClassifier | LGBMRegressor | LGBMRanker
 type AssetChunk = pl.DataFrame
-type AssetReturnType = AssetChunk | pl.LazyFrame | LGBMReturnType | Iterator[AssetChunk] | AsyncIterator[AssetChunk]
+type AssetReturnType = (
+    AssetChunk | pl.LazyFrame | LGBMReturnType | duckdb.DuckDBPyRelation
+    | Iterator[AssetChunk] | AsyncIterator[AssetChunk]
+)
 type PrimaryKey = str | pl.Expr | Sequence[str] | Sequence[pl.Expr]
 
 _PRIMARY_KEY_REQUIRED_MODES = frozenset({Mode.APPEND_THEN_MERGE})
@@ -58,6 +68,12 @@ class AssetSettings(BaseModel):
     def _check_primary_key_required(self) -> "AssetSettings":
         if self.storage.mode in _PRIMARY_KEY_REQUIRED_MODES and self.primary_key is None:
             raise ValueError(f"storage.mode={self.storage.mode!r} requires `primary_key` to be set on the asset")
+        return self
+
+    @model_validator(mode="after")
+    def _check_primary_key_incompatible_with_lgbm(self) -> "AssetSettings":
+        if isinstance(self.storage, LGBMStorageConfig) and self.primary_key is not None:
+            raise ValueError("primary_key has no meaning for LGBMStorageConfig - a model has no rows to key by")
         return self
 
 
@@ -140,9 +156,11 @@ def asset(
     above exist only so a type checker picks the right return type for each form. """
 
     def decorator(inner_func: AssetFunc) -> AssetFunc:
+        resolved_storage = storage if isinstance(storage, BaseStorageConfig) else make_default_storage_config(storage)
         _check_self_reference(inner_func, _coerce_dependencies(dependencies))
+        resolved_storage.check_compatible(inner_func)
         settings = AssetSettings(
-            storage=storage if isinstance(storage, BaseStorageConfig) else make_default_storage_config(storage),
+            storage=resolved_storage,
             primary_key=primary_key,
             schemas=schemas,
             dependencies=_coerce_dependencies(dependencies),
