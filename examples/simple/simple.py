@@ -1,75 +1,71 @@
-from typing import AsyncIterator
-
 import polars as pl
+from lightgbm import LGBMClassifier
+from sklearn.datasets import load_iris
 
 from repipe import Repipe
-from repipe.asset.asset import asset, AssetContext
-from repipe.storage import Mode, ParquetStorageConfig
-from repipe.testing.data_quality import data_quality_test, TestResult
+from repipe.asset import AssetContext, AssetOut, PartitionSettings, asset, multi_asset
+from repipe.storage import LGBMStorageConfig
 
 
-@data_quality_test
-def my_data_quality_test() -> TestResult:
-    return TestResult(
-        success=False
+@asset(schemas=["source"])
+def iris_raw(context: AssetContext) -> pl.DataFrame:
+    """ Step 1: add the iris dataset. """
+    iris = load_iris()  # pyright's bundled sklearn stub mis-resolves this to the return_X_y=True overload
+    return pl.DataFrame(iris.data, schema=iris.feature_names).with_columns(  # pyright: ignore[reportAttributeAccessIssue]
+        pl.Series("target", iris.target)  # pyright: ignore[reportAttributeAccessIssue]
     )
 
 
 @asset(
-    dependencies=[],
-    schemas=["source"],
-)
-def my_asset(
-        context: AssetContext
-) -> pl.LazyFrame:
-    return pl.DataFrame(
-        {
-            "column_a": [1, 2, 3, 4, 5],
-            "column_b": [5, 4, 3, 2, 1]
-        }
-    ).lazy()
-
-
-@asset(
-    dependencies=["my_downstream_asset", "my_asset"],
+    dependencies=["iris_raw"],
     schemas=["intermediate"],
-    storage=ParquetStorageConfig(mode=Mode.APPEND_THEN_MERGE),
-    primary_key="column_a",
+    partition=PartitionSettings(columns={"species": pl.Int64}),
 )
-async def my_downstream_asset(
-        context: AssetContext,
-        my_downstream_asset: pl.LazyFrame | None,
-        my_asset: pl.LazyFrame,
-) -> AsyncIterator[pl.DataFrame]:
+def iris_renamed(context: AssetContext, iris_raw: pl.DataFrame) -> pl.DataFrame:
+    """ Step 2: rename the columns to something friendlier than sklearn's defaults. """
+    return iris_raw.rename({
+        "sepal length (cm)": "sepal_length",
+        "sepal width (cm)": "sepal_width",
+        "petal length (cm)": "petal_length",
+        "petal width (cm)": "petal_width",
+        "target": "species",
+    })
 
-    """ Streams chunks, each written as its own part file, then merged by the mode above. """
-    for chunk in pl.concat([my_asset, my_asset]).collect().iter_slices(n_rows=5):
-        yield chunk
+
+@multi_asset(
+    outputs={
+        "iris_train": AssetOut(schemas=["intermediate"]),
+        "iris_test": AssetOut(schemas=["intermediate"]),
+    },
+    dependencies=["iris_renamed"],
+)
+def iris_split(context: AssetContext, iris_renamed: pl.DataFrame) -> dict[str, pl.DataFrame]:
+    """ Step 3: hold back a fifth of the rows for testing. """
+    shuffled = iris_renamed.sample(fraction=1.0, shuffle=True, seed=0)
+    train_rows = len(shuffled) * 4 // 5
+    return {"iris_train": shuffled.head(train_rows), "iris_test": shuffled.tail(-train_rows)}
 
 
 @asset(
-    dependencies=[
-        'my_downstream_asset'
-    ],
+    dependencies=["iris_train"],
     schemas=["mart"],
-    tests=[
-        my_data_quality_test
-    ]
+    storage=LGBMStorageConfig(),
 )
-def my_lgbm_asset(
-        context: AssetContext,
-        my_downstream_asset: pl.LazyFrame,
-) -> pl.LazyFrame:
-    # TODO: `storage.save()` doesn't yet support persisting a real LGBMReturnType (only
-    # DataFrame/LazyFrame) - returning one here would crash at materialization time, so this
-    # stays a LazyFrame until that's built out.
-    return my_downstream_asset.first()
+def iris_model(context: AssetContext, iris_train: pl.DataFrame) -> LGBMClassifier:
+    """ Step 4: train an LGBM model on the training rows. """
+    model = LGBMClassifier(n_estimators=10, verbose=-1)
+    model.fit(
+        iris_train.select("sepal_length", "sepal_width", "petal_length", "petal_width"),
+        iris_train["species"],
+    )
+    return model
 
 
 app = Repipe(
     assets=[
-        my_asset,
-        my_downstream_asset,
-        my_lgbm_asset
+        iris_raw,
+        iris_renamed,
+        iris_split,
+        iris_model,
     ]
 )

@@ -50,7 +50,8 @@ def build_graph(assets: Mapping[str, Asset]) -> dict[str, GraphNode]:
             id=asset_name,
             kind=NodeKind.ASSET,
             name=asset_name,
-            upstream=frozenset(manifest.settings.dependency_names) - {asset_name},
+            # A dependency on one of its own outputs is the previous output, not an edge
+            upstream=frozenset(manifest.function.dependency_names) - set(manifest.function.outputs),
             labels=labels,
             obj=manifest,
         )
