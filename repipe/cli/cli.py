@@ -1,6 +1,6 @@
 import asyncio
 import shutil
-from typing import Iterator, cast
+from typing import Iterable, Iterator, cast
 
 import typer
 
@@ -39,17 +39,27 @@ def _selected_assets(runtime: Runtime) -> Iterator[Asset]:
             yield cast(Asset, node.obj)
 
 
-def _matching_partitions(asset: Asset, filters: list[str]) -> list[PartitionKey]:
-    """ The asset's existing partitions matching every `column=value` filter. """
+def _targets(assets: Iterable[Asset], filters: list[str]) -> list[tuple[Asset, list[PartitionKey | None]]]:
+    """ Each asset with its partitions matching every `column=value` filter, or `[None]` (the whole
+    asset) without filters. Checks every asset before returning, so nothing is half done. """
     if any("=" not in f for f in filters):
         raise typer.BadParameter(f"--partition takes column=value, got {filters!r}")
     wanted = dict(f.split("=", 1) for f in filters)
-    if asset.settings.partition is None:
-        raise typer.BadParameter(f"asset {asset.name!r} isn't partitioned")
-    return [
-        key for key in get_storage_concrete(asset.settings.storage).existing_partitions(asset)
-        if all(column in key and format_value(key[column]) == value for column, value in wanted.items())
-    ]
+    targets: list[tuple[Asset, list[PartitionKey | None]]] = []
+    for asset in assets:
+        if not wanted:
+            targets.append((asset, [None]))
+            continue
+        settings = asset.settings.partition
+        if settings is None:
+            raise typer.BadParameter(f"asset {asset.name!r} isn't partitioned")
+        if unknown := set(wanted) - set(settings.columns):
+            raise typer.BadParameter(f"asset {asset.name!r} has no partition columns {sorted(unknown)!r}")
+        targets.append((asset, [
+            key for key in get_storage_concrete(asset.settings.storage).existing_partitions(asset)
+            if all(format_value(key[column]) == value for column, value in wanted.items())
+        ]))
+    return targets
 
 
 @app.callback()
@@ -97,13 +107,11 @@ def consolidate(
 ):
     """ Compacts (and dedupes, where configured) every selected asset's part files - the
     same logic `Mode.APPEND_THEN_MERGE` runs automatically, available here on demand. """
-    for asset in _selected_assets(_build_runtime(selectors)):
+    for asset, keys in _targets(_selected_assets(_build_runtime(selectors)), partition):
         config = asset.settings.storage
         if max_rows_per_file is not None:
             config = config.model_copy(update={"max_rows_per_file": max_rows_per_file})
-        if not partition:
-            consolidate_asset(config, asset)
-        for key in _matching_partitions(asset, partition) if partition else []:
+        for key in keys:
             consolidate_asset(config, asset, key)
 
 
@@ -125,7 +133,7 @@ def partitions(
 def clear(
         selectors: list[str] = typer.Argument(None, help=_SELECTOR_HELP),
         partition: list[str] = typer.Option([], "--partition", help=_PARTITION_HELP),
-        staging: bool = typer.Option(False, "--staging", help="Only delete staging left behind by crashed runs."),
+        staging: bool = typer.Option(False, "--staging", help="Only delete staging left behind by crashed runs. A run in progress will fail."),
 ):
     """ Deletes the selected assets' data (or some of their partitions). """
     runtime = _build_runtime(selectors)
@@ -135,12 +143,9 @@ def clear(
         return
     if not selectors:
         raise typer.BadParameter("select the assets to clear - this deletes their data")
-    for asset in _selected_assets(runtime):
-        storage = get_storage_concrete(asset.settings.storage)
-        if not partition:
-            storage.clear(asset)
-        for key in _matching_partitions(asset, partition) if partition else []:
-            storage.clear(asset, key)
+    for asset, keys in _targets(_selected_assets(runtime), partition):
+        for key in keys:
+            get_storage_concrete(asset.settings.storage).clear(asset, key)
 
 
 if __name__ == "__main__":

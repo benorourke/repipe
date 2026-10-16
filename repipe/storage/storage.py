@@ -5,10 +5,9 @@ import enum
 import inspect
 import itertools
 import pickle
-import shutil
 import uuid
 from abc import abstractmethod
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping, Set as AbstractSet
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, cast, overload
 
@@ -59,7 +58,7 @@ class BaseStorageConfig(BaseModel):
         `None` (default) merges everything into a single file instead. """
 
     def check_compatible(self, inner_func: Callable[..., Any], partition: PartitionSettings | None) -> None:
-        """ Hook for a storage backend to reject an asset function shape it can't represent. """
+        """ Hook for a storage backend to reject an `@asset` function shape it can't represent. """
 
 
 class ParquetStorageConfig(BaseStorageConfig):
@@ -163,24 +162,15 @@ class StorageConcrete[LoadType, SaveType, ConfigType](abc.ABC):
     def stage(
             self, config: ConfigType, asset: Asset, obj: SaveType, directory: Path, chunk_number: int,
             partition: Mapping[str, Any] | None = None,
+            run_partitions: AbstractSet[PartitionKey] = frozenset(),
     ) -> set[PartitionKey]:
         """ Writes `obj` under `directory` and returns the partitions it wrote to. `partition`
-        is an explicit key, for data that can't be split by its columns (e.g. a model). """
+        is an explicit key, for data that can't be split by its columns (e.g. a model).
+        `run_partitions` are those already written this run, which count towards
+        `max_partitions_per_run`. """
         raise NotImplementedError()
 
-    def save(
-            self, config: ConfigType, asset: Asset, obj: SaveType, run_id: str, part_number: int,
-            partition: Mapping[str, Any] | None = None,
-    ) -> None:
-        """ Stages and promotes a single chunk straight away, outside of any write session. """
-        directory = staging_dir(asset.base_storage_path, uuid.uuid4().hex)
-        try:
-            self.stage(config, asset, obj, directory, 1, partition)
-            self.promote(asset, directory, run_id, first_number=part_number)
-        finally:
-            shutil.rmtree(directory, ignore_errors=True)
-
-    def promote(self, asset: Asset, directory: Path, run_id: str, first_number: int = 1) -> None:
+    def promote(self, asset: Asset, directory: Path, run_id: str) -> None:
         """ Moves every staged file into the asset directory, numbered in staging order so that
         later chunks of a run sort after earlier ones. """
         staged = sorted(directory.rglob(f"*.{self.extension}")) if directory.exists() else []
@@ -189,26 +179,33 @@ class StorageConcrete[LoadType, SaveType, ConfigType](abc.ABC):
             target = self.asset_dir(asset) / path.parent.relative_to(directory)
             if target not in numbers:
                 target.mkdir(parents=True, exist_ok=True)
-                numbers[target] = itertools.count(first_number)
+                numbers[target] = itertools.count(1)
             path.rename(target / self._pending_name(run_id, next(numbers[target])))
 
     def replace(self, asset: Asset, run_id: str, partition: PartitionKey | None = None) -> None:
-        """ Deletes everything under `partition` (the whole asset if `None`) not written by `run_id`. """
+        """ Deletes everything under `partition` (the whole asset if `None`) not written by
+        `run_id`, including files left in another partition layout. """
         directory = self.partition_dir(asset, partition)
         self._delete_under(directory, keep=lambda path: path.name.startswith(f"run-{run_id}-"))
-        if directory != self.asset_dir(asset) and directory.exists() and not any(directory.iterdir()):
-            directory.rmdir()
-            self._remove_empty_parents(directory, stop=self.asset_dir(asset))
+        self._remove_empty_dirs(directory, stop=self.asset_dir(asset))
 
     def clear(self, asset: Asset, partition: PartitionKey | None = None) -> None:
         """ Drops everything written for `asset` (or one partition of it), immediately. """
         directory = self.partition_dir(asset, partition)
-        shutil.rmtree(directory, ignore_errors=True)
-        self._remove_empty_parents(directory, stop=self.asset_dir(asset))
+        self._delete_under(directory, keep=lambda path: False)
+        self._remove_empty_dirs(directory, stop=self.asset_dir(asset) if partition else directory.parent)
 
     def existing_parts(self, asset: Asset, partition: PartitionKey | None = None) -> set[Path]:
-        directory = self.partition_dir(asset, partition)
-        return set(directory.rglob(f"*.{self.extension}")) if directory.exists() else set()
+        """ Files that are where the asset's partition settings would put them. """
+        settings = asset.settings.partition
+        directory = self.asset_dir(asset)
+        if settings is None:
+            return set(directory.glob(f"*.{self.extension}")) if partition is None else set()
+        return {
+            path for path in self._own_files(self.partition_dir(asset, partition))
+            if path.suffix == f".{self.extension}"
+            and PartitionKey.from_relative_path(settings, path.parent.relative_to(directory)) is not None
+        }
 
     def existing_partitions(self, asset: Asset) -> list[PartitionKey]:
         """ Read off the directory names - polars can't list partitions without opening every file. """
@@ -224,16 +221,8 @@ class StorageConcrete[LoadType, SaveType, ConfigType](abc.ABC):
     def layout_matches(self, asset: Asset) -> bool:
         """ False if existing files sit where the asset's current partition settings wouldn't put
         them, e.g. it was partitioned since they were written. Polars can't read a mix. """
-        settings = asset.settings.partition
-        directory = self.asset_dir(asset)
-        for part in self.existing_parts(asset):
-            relative = part.parent.relative_to(directory)
-            if settings is None:
-                if relative != Path():
-                    return False
-            elif PartitionKey.from_relative_path(settings, relative) is None:
-                return False
-        return True
+        parts = {path for path in self._own_files(self.asset_dir(asset)) if path.suffix == f".{self.extension}"}
+        return parts == self.existing_parts(asset)
 
     def asset_dir(self, asset: Asset) -> Path:
         return asset.base_storage_path_with_schema / asset.name
@@ -258,23 +247,39 @@ class StorageConcrete[LoadType, SaveType, ConfigType](abc.ABC):
     def _chunk_name(self, chunk_number: int, index: int = 0) -> str:
         return f"chunk-{chunk_number:06d}-{index:08d}.{self.extension}"
 
-    @staticmethod
-    def _delete_under(directory: Path, keep: Callable[[Path], bool]) -> None:
-        if not directory.exists():
+    @classmethod
+    def _own_files(cls, directory: Path) -> Iterator[Path]:
+        """ Files in `directory` and its `k=v` subdirectories. Other subdirectories aren't this
+        asset's: one named after it in `schemas` keeps its assets in here too. """
+        if not directory.is_dir():
             return
-        for path in sorted(directory.rglob("*"), reverse=True):  # children before their parents
-            if path.is_dir():
+        for path in directory.iterdir():
+            if path.is_file():
+                yield path
+            elif "=" in path.name:
+                yield from cls._own_files(path)
+
+    @classmethod
+    def _delete_under(cls, directory: Path, keep: Callable[[Path], bool]) -> None:
+        """ Deletes each file `_own_files` would find that `keep` rejects, then the `k=v`
+        directories that leaves empty. """
+        if not directory.is_dir():
+            return
+        for path in list(directory.iterdir()):
+            if path.is_file():
+                if not keep(path):
+                    path.unlink()
+            elif "=" in path.name:
+                cls._delete_under(path, keep)
                 if not any(path.iterdir()):
                     path.rmdir()
-            elif not keep(path):
-                path.unlink()
 
     @staticmethod
-    def _remove_empty_parents(directory: Path, stop: Path) -> None:
-        while directory != stop and directory.is_relative_to(stop):
+    def _remove_empty_dirs(directory: Path, stop: Path) -> None:
+        """ Removes `directory`, then each parent below `stop`, while they're empty. """
+        while directory != stop and directory.is_relative_to(stop) and directory.is_dir() and not any(directory.iterdir()):
+            directory.rmdir()
             directory = directory.parent
-            if directory.exists() and directory != stop and not any(directory.iterdir()):
-                directory.rmdir()
 
 
 class PolarsPartitionedStorage[ConfigType](
@@ -309,6 +314,7 @@ class PolarsPartitionedStorage[ConfigType](
     def stage(
             self, config: ConfigType, asset: Asset, obj: pl.DataFrame | pl.LazyFrame, directory: Path,
             chunk_number: int, partition: Mapping[str, Any] | None = None,
+            run_partitions: AbstractSet[PartitionKey] = frozenset(),
     ) -> set[PartitionKey]:
         if not isinstance(obj, (pl.DataFrame, pl.LazyFrame)):
             raise TypeError(
@@ -329,7 +335,8 @@ class PolarsPartitionedStorage[ConfigType](
             return set()
 
         explicit = PartitionKey.from_mapping(settings, partition) if partition is not None else None
-        written = self._sink_partitioned(_with_key_columns(asset, obj.lazy(), explicit), directory, settings, chunk_number)
+        lf = _with_key_columns(asset, obj.lazy(), explicit)
+        written = self._sink_partitioned(asset, lf, directory, chunk_number, run_partitions)
         if explicit is not None and written - {explicit}:
             raise ValueError(
                 f"asset {asset.name!r} was given partition {dict(explicit)!r}, but its rows also cover "
@@ -338,10 +345,12 @@ class PolarsPartitionedStorage[ConfigType](
         return written
 
     def _sink_partitioned(
-            self, lf: pl.LazyFrame, directory: Path, settings: PartitionSettings, chunk_number: int,
+            self, asset: Asset, lf: pl.LazyFrame, directory: Path, chunk_number: int,
+            run_partitions: AbstractSet[PartitionKey],
     ) -> set[PartitionKey]:
         """ `pl.PartitionBy` is unstable in polars 1.44 - if it breaks, collect and use
         `DataFrame.partition_by(as_dict=True)` instead, at the cost of streaming. """
+        settings = cast(PartitionSettings, asset.settings.partition)
         written: set[PartitionKey] = set()
 
         def file_path(args: Any) -> str:
@@ -351,14 +360,18 @@ class PolarsPartitionedStorage[ConfigType](
                 if value is None or value == RESERVED_VALUE:
                     raise ValueError(f"partition column {name!r} can't be null or {RESERVED_VALUE!r}")
             written.add(key)
+            # Checked here so a frame with too many partitions fails before writing them all
+            _check_partition_count(asset, run_partitions | written)
             return str(key.relative_path() / self._chunk_name(chunk_number, args.index_in_partition))
 
         self.sink(lf, pl.PartitionBy(str(directory), key=list(settings.columns), include_key=True, file_path_provider=file_path))
         return written
 
     def load(self, config: ConfigType, asset: Asset) -> pl.LazyFrame:
-        pattern = "**/*" if asset.settings.partition else "*"
-        return self.scan_asset(asset, self.asset_dir(asset) / f"{pattern}.{self.extension}")
+        # Spelled out rather than `**`, which would also pick up assets nested in here by `schemas`
+        settings = asset.settings.partition
+        levels = [f"{name}=*" for name in settings.columns] if settings else []
+        return self.scan_asset(asset, self.asset_dir(asset).joinpath(*levels, f"*.{self.extension}"))
 
     def load_previous(self, config: ConfigType, asset: Asset) -> pl.LazyFrame | None:
         parts = sorted(self.existing_parts(asset))
@@ -428,6 +441,15 @@ class PolarsPartitionedStorage[ConfigType](
         for old_part in old_parts:
             if old_part not in new_paths:
                 old_part.unlink()
+
+
+def _check_partition_count(asset: Asset, partitions: AbstractSet[PartitionKey]) -> None:
+    limit = cast(PartitionSettings, asset.settings.partition).max_partitions_per_run
+    if len(partitions) > limit:
+        raise ValueError(
+            f"asset {asset.name!r} wrote more than max_partitions_per_run={limit} partitions - "
+            f"check it's partitioned by the right columns, or raise the limit"
+        )
 
 
 def _with_key_columns(asset: Asset, lf: pl.LazyFrame, explicit: PartitionKey | None) -> pl.LazyFrame:
@@ -533,6 +555,7 @@ class LGBMModelStorage(StorageConcrete[LGBMReturnType, LGBMReturnType, LGBMStora
     def stage(
             self, config: LGBMStorageConfig, asset: Asset, obj: LGBMReturnType, directory: Path,
             chunk_number: int, partition: Mapping[str, Any] | None = None,
+            run_partitions: AbstractSet[PartitionKey] = frozenset(),
     ) -> set[PartitionKey]:
         if not isinstance(obj, (LGBMClassifier, LGBMRegressor, LGBMRanker)):
             raise TypeError(
@@ -552,6 +575,7 @@ class LGBMModelStorage(StorageConcrete[LGBMReturnType, LGBMReturnType, LGBMStora
             )
         else:
             key = PartitionKey.from_mapping(settings, partition)
+            _check_partition_count(asset, run_partitions | {key})
 
         target = directory / key.relative_path() if key else directory
         target.mkdir(parents=True, exist_ok=True)

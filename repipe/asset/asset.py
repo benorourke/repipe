@@ -263,7 +263,8 @@ def _register(
     for name, output in outputs.items():
         storage = output.storage
         resolved_storage = storage if isinstance(storage, BaseStorageConfig) else make_default_storage_config(storage)
-        resolved_storage.check_compatible(inner_func, output.partition)
+        if not is_multi:  # a multi-asset writes every output through `Output`, whatever its shape
+            resolved_storage.check_compatible(inner_func, output.partition)
         settings[name] = AssetSettings(
             storage=resolved_storage,
             primary_key=output.primary_key,

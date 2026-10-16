@@ -84,7 +84,8 @@ class PartitionKey(Mapping[str, PartitionValue]):
 
     @classmethod
     def from_relative_path(cls, settings: PartitionSettings, path: Path) -> PartitionKey | None:
-        """ The inverse of `relative_path`, or `None` if `path` isn't a leaf partition directory. """
+        """ The inverse of `relative_path`, or `None` if `path` isn't a leaf partition directory
+        for these settings, e.g. it was written before a column's dtype changed. """
         if len(path.parts) != len(settings.columns):
             return None
         items = []
@@ -92,7 +93,14 @@ class PartitionKey(Mapping[str, PartitionValue]):
             column, sep, encoded = part.partition("=")
             if column != name or not sep:
                 return None
-            items.append((name, _decode(unquote(encoded), dtype)))
+            try:
+                value = _decode(unquote(encoded), dtype)
+            except ValueError:
+                return None
+            # Rejects values that parse but aren't how we'd write them, e.g. "007" as an integer.
+            if encode_value(value) != encoded:
+                return None
+            items.append((name, value))
         return cls(items)
 
     def relative_path(self) -> Path:
@@ -139,6 +147,8 @@ def _decode(text: str, dtype: pl.DataType) -> PartitionValue:
     if dtype == pl.Date:
         return date.fromisoformat(text)
     if dtype == pl.Boolean:
+        if text not in ("true", "false"):
+            raise ValueError(f"not a boolean: {text!r}")
         return text == "true"
     if dtype.is_integer():
         return int(text)
