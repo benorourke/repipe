@@ -22,8 +22,8 @@ from repipe.storage import (
 )
 from repipe.testing.data_quality import DataQualityTest
 
-type AssetChunk = pl.DataFrame
-type AssetData = AssetChunk | pl.LazyFrame | LGBMReturnType | duckdb.DuckDBPyRelation
+type AssetChunk = pl.DataFrame | pl.LazyFrame
+type AssetData = AssetChunk | LGBMReturnType | duckdb.DuckDBPyRelation
 
 
 @dataclass(frozen=True)

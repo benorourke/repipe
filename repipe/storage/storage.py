@@ -182,6 +182,31 @@ class StorageConcrete[LoadType, SaveType, ConfigType](abc.ABC):
                 numbers[target] = itertools.count(1)
             path.rename(target / self._pending_name(run_id, next(numbers[target])))
 
+    def commit(
+            self, config: ConfigType, asset: Asset, staged_dir: Path, run_id: str,
+            partitions: AbstractSet[PartitionKey],
+    ) -> None:
+        """ Promotes everything staged this run into place, then applies `config.mode`:
+        OVERWRITE deletes whatever each touched replace unit didn't just receive, and
+        APPEND_THEN_MERGE consolidates each partition `partitions` names (the whole asset if
+        it isn't partitioned). The caller only needs to know what it staged and where - not
+        what each mode means. """
+        self.promote(asset, staged_dir, run_id)
+
+        base_config = cast(BaseStorageConfig, config)
+        settings = asset.settings.partition
+        if base_config.mode == Mode.OVERWRITE:
+            if settings is None or not settings.overwrite_by:
+                self.replace(asset, run_id)
+            else:
+                for unit in {key.prefix(len(settings.overwrite_by)) for key in partitions}:
+                    self.replace(asset, run_id, unit)
+        elif base_config.mode == Mode.APPEND_THEN_MERGE:
+            if settings is None:
+                self.consolidate(config, asset)
+            for key in partitions:
+                self.consolidate(config, asset, key)
+
     def replace(self, asset: Asset, run_id: str, partition: PartitionKey | None = None) -> None:
         """ Deletes everything under `partition` (the whole asset if `None`) not written by
         `run_id`, including files left in another partition layout. """

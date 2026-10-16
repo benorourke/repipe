@@ -68,20 +68,7 @@ class WriteSession:
         config = asset.settings.storage
         storage = get_storage_concrete(config)
         partitions = self._partitions.get(asset.name, set())
-        settings = asset.settings.partition
-
-        storage.promote(asset, self.root / asset.name, self.run_id)
-        if config.mode == Mode.OVERWRITE:
-            if settings is None or not settings.overwrite_by:
-                storage.replace(asset, self.run_id)
-            else:
-                for unit in {key.prefix(len(settings.overwrite_by)) for key in partitions}:
-                    storage.replace(asset, self.run_id, unit)
-        elif config.mode == Mode.APPEND_THEN_MERGE:
-            if settings is None:
-                storage.consolidate(config, asset)
-            for key in partitions:
-                storage.consolidate(config, asset, key)
+        storage.commit(config, asset, self.root / asset.name, self.run_id, partitions)
 
     def _check_staging_exists(self, asset_name: str) -> None:
         # Otherwise what was staged is lost, and OVERWRITE would replace the asset with what's left
