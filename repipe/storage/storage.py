@@ -5,9 +5,9 @@ import enum
 import inspect
 import itertools
 import pickle
-import shutil
 import uuid
 from abc import abstractmethod
+from collections.abc import Iterator, Mapping, Set as AbstractSet
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, cast, overload
 
@@ -15,10 +15,12 @@ import polars as pl
 from lightgbm import LGBMClassifier, LGBMRanker, LGBMRegressor
 from pydantic import BaseModel, model_validator
 
+from repipe.asset.partition import PartitionKey, PartitionSettings
+
 if TYPE_CHECKING:
     from repipe.asset.asset import Asset
 
-type LGBMReturnType = LGBMClassifier | LGBMRegressor | LGBMRanker
+type LGBMModel = LGBMClassifier | LGBMRegressor | LGBMRanker
 
 
 class StorageType(enum.StrEnum):
@@ -31,10 +33,8 @@ class StorageType(enum.StrEnum):
 class Mode(enum.StrEnum):
 
     OVERWRITE = "overwrite"
-    """ After this run's new part(s) write successfully, deletes every part - pending or
-        canonical - left over from before this run. Deleting only after the new write
-        succeeds (never before) means a failed run can't destroy the last good output.
-        Net effect: the directory holds only the latest run's part(s). """
+    """ Once the run succeeds, deletes everything it didn't write - the whole asset, or for a
+        partitioned asset, just the partitions it wrote to. A failed run changes nothing. """
 
     APPEND = "append"
     """ Just writes a new pending part - nothing is deleted or compacted. Parts accumulate,
@@ -56,8 +56,8 @@ class BaseStorageConfig(BaseModel):
     """ Caps each file `consolidate()` writes to, via polars' native partitioned sink.
         `None` (default) merges everything into a single file instead. """
 
-    def check_compatible(self, inner_func: Callable[..., Any]) -> None:
-        """ Hook for a storage backend to reject an asset function shape it can't represent. """
+    def check_compatible(self, inner_func: Callable[..., Any], partition: PartitionSettings | None) -> None:
+        """ Hook for a storage backend to reject an `@asset` function shape it can't represent. """
 
 
 class ParquetStorageConfig(BaseStorageConfig):
@@ -88,8 +88,10 @@ class LGBMStorageConfig(BaseStorageConfig):
             raise ValueError("LGBMStorageConfig doesn't support max_rows_per_file - a model isn't rows")
         return self
 
-    def check_compatible(self, inner_func: Callable[..., Any]) -> None:
-        if inspect.isgeneratorfunction(inner_func) or inspect.isasyncgenfunction(inner_func):
+    def check_compatible(self, inner_func: Callable[..., Any], partition: PartitionSettings | None) -> None:
+        # A partitioned model asset yields one keyed `Output` per partition, so only an
+        # unpartitioned one has to return a single model.
+        if partition is None and (inspect.isgeneratorfunction(inner_func) or inspect.isasyncgenfunction(inner_func)):
             raise ValueError(
                 f"asset {inner_func.__name__!r} is a generator but uses LGBMStorageConfig - "
                 f"a trained model has no per-chunk parts to write; return a single model instead"
@@ -113,23 +115,45 @@ def make_default_storage_config(storage_type: StorageType) -> StorageConfig:
             raise NotImplementedError()
 
 
-class LoadStrategy[T, ConfigType](abc.ABC):
-
-    @abstractmethod
-    def load(self, config: ConfigType, asset: Asset) -> T:
-        pass
-
-
-class SaveStrategy[T, ConfigType](abc.ABC):
-
-    @abstractmethod
-    def save(self, config: ConfigType, asset: Asset, obj: T, run_id: str, part_number: int):
-        pass
+def staging_root(base_storage_path: Path) -> Path:
+    """ Where runs stage their writes before committing them. Outside every asset directory,
+    since stray files inside one break scans, and under `base_storage_path` so the commit's
+    renames stay on one filesystem. """
+    return base_storage_path / ".repipe" / "staging"
 
 
-class StorageConcrete[LoadType, SaveType, ConfigType](
-    LoadStrategy[LoadType, ConfigType], SaveStrategy[SaveType, ConfigType]
-):
+def staging_dir(base_storage_path: Path, run_id: str) -> Path:
+    return staging_root(base_storage_path) / run_id
+
+
+class StorageConcrete[LoadType, SaveType, ConfigType](abc.ABC):
+    """ Writes happen in two steps: `stage` writes a chunk into a staging directory, then
+    `promote` moves everything staged into the asset directory as `run-{run_id}-part-{n}`,
+    pending until `replace` or `consolidate` settles it. A partitioned asset has the same
+    layout, one level per partition column.
+
+    Each asset gets its own directory (`asset_dir`) - that's the only thing a multi-asset's
+    outputs share, since the session commits each one independently, with its own mode and
+    partition settings:
+
+        data/
+          runners/                     # multi-asset output, partitioned by date, OVERWRITE
+            date=2026-10-12/
+              run-20261016-101500-123-0001-part-000001.parquet
+            date=2026-10-13/
+              run-20261016-101500-123-0001-part-000001.parquet
+          odds/                        # sibling output, unpartitioned, APPEND_THEN_MERGE
+            part-1.csv
+
+    `replace` (under `OVERWRITE`) deletes everything in the touched replace unit that isn't
+    from the current run - pending or already-canonical alike. `consolidate` (under
+    `APPEND_THEN_MERGE`) rewrites every existing file in the directory, pending and canonical,
+    into a fresh canonical `part-{n}` set - which is why a consolidated asset's files are
+    always canonical: nothing pending survives past the commit that wrote it. """
+
+    # A plain class attribute, not an abstract `@property` - each subclass sets this directly
+    # (`extension = "parquet"`), which pyright can only check against a plain attribute.
+    extension: str
 
     @property
     @abstractmethod
@@ -137,17 +161,10 @@ class StorageConcrete[LoadType, SaveType, ConfigType](
         raise NotImplementedError()
 
     @abstractmethod
-    def clear(self, asset: Asset) -> None:
-        """ Drops everything previously written for `asset`, immediately. """
+    def load(self, config: ConfigType, asset: Asset) -> LoadType:
         raise NotImplementedError()
 
     @abstractmethod
-    def existing_parts(self, asset: Asset) -> set[Path]:
-        """ Every part file currently on disk for `asset`, before any new write - lets a
-        caller (e.g. `Mode.OVERWRITE`) snapshot what to delete *after* a new write succeeds,
-        instead of clearing upfront and risking the old data if the write then fails. """
-        raise NotImplementedError()
-
     def load_previous(self, config: ConfigType, asset: Asset) -> LoadType | None:
         """ A snapshot of what is on disk for `asset` right now, or `None` if nothing has been
         written yet. Fixed to the parts that exist at call time - unlike `load`, which may
@@ -155,28 +172,166 @@ class StorageConcrete[LoadType, SaveType, ConfigType](
         raise NotImplementedError()
 
     @abstractmethod
-    def consolidate(self, config: ConfigType, asset: Asset) -> None:
-        """ Compacts (and, per `config`, dedupes) every part file, per `config.max_rows_per_file`. """
+    def consolidate(self, config: ConfigType, asset: Asset, partition: PartitionKey | None = None) -> None:
+        """ Compacts (and, per `config`, dedupes) the part files of each partition matching
+        `partition`, or of the whole asset if it isn't partitioned. """
         raise NotImplementedError()
+
+    @abstractmethod
+    def stage(
+            self, config: ConfigType, asset: Asset, obj: SaveType, directory: Path, chunk_number: int,
+            partition: Mapping[str, Any] | None = None,
+    ) -> set[PartitionKey]:
+        """ Writes `obj` under `directory` and returns the partitions it wrote to. `partition`
+        is an explicit key, for data that can't be split by its columns (e.g. a model). """
+        raise NotImplementedError()
+
+    def promote(self, asset: Asset, directory: Path, run_id: str) -> None:
+        """ Moves every staged file into the asset directory, numbered in staging order so that
+        later chunks of a run sort after earlier ones. """
+        staged = sorted(directory.rglob(f"*.{self.extension}")) if directory.exists() else []
+        numbers: dict[Path, itertools.count[int]] = {}
+        for path in staged:
+            target = self.asset_dir(asset) / path.parent.relative_to(directory)
+            if target not in numbers:
+                target.mkdir(parents=True, exist_ok=True)
+                numbers[target] = itertools.count(1)
+            path.rename(target / self._pending_name(run_id, next(numbers[target])))
+
+    def commit(
+            self, config: ConfigType, asset: Asset, staged_dir: Path, run_id: str,
+            partitions: AbstractSet[PartitionKey],
+    ) -> None:
+        """ Promotes everything staged this run into place, then applies `config.mode`:
+        OVERWRITE deletes whatever each touched replace unit didn't just receive, and
+        APPEND_THEN_MERGE consolidates each partition `partitions` names (the whole asset if
+        it isn't partitioned). The caller only needs to know what it staged and where - not
+        what each mode means. """
+        self.promote(asset, staged_dir, run_id)
+
+        base_config = cast(BaseStorageConfig, config)
+        settings = asset.settings.partition
+        if base_config.mode == Mode.OVERWRITE:
+            if settings is None:
+                self.replace(asset, run_id)
+            else:
+                for key in partitions:
+                    self.replace(asset, run_id, key)
+        elif base_config.mode == Mode.APPEND_THEN_MERGE:
+            if settings is None:
+                self.consolidate(config, asset)
+            for key in partitions:
+                self.consolidate(config, asset, key)
+
+    def replace(self, asset: Asset, run_id: str, partition: PartitionKey | None = None) -> None:
+        """ Deletes everything under `partition` (the whole asset if `None`) not written by
+        `run_id`, including files left in another partition layout. """
+        directory = self.partition_dir(asset, partition)
+        self._delete_under(directory, keep=lambda path: path.name.startswith(f"run-{run_id}-"))
+        self._remove_empty_dirs(directory, stop=self.asset_dir(asset))
+
+    def clear(self, asset: Asset, partition: PartitionKey | None = None) -> None:
+        """ Drops everything written for `asset` (or one partition of it), immediately. """
+        directory = self.partition_dir(asset, partition)
+        self._delete_under(directory, keep=lambda path: False)
+        self._remove_empty_dirs(directory, stop=self.asset_dir(asset) if partition else directory.parent)
+
+    def existing_parts(self, asset: Asset, partition: PartitionKey | None = None) -> set[Path]:
+        """ Files that are where the asset's partition settings would put them. """
+        settings = asset.settings.partition
+        directory = self.asset_dir(asset)
+        if settings is None:
+            return set(directory.glob(f"*.{self.extension}")) if partition is None else set()
+        return {
+            path for path in self._own_files(self.partition_dir(asset, partition))
+            if path.suffix == f".{self.extension}"
+            and PartitionKey.from_relative_path(settings, path.parent.relative_to(directory)) is not None
+        }
+
+    def existing_partitions(self, asset: Asset) -> list[PartitionKey]:
+        """ Read off the directory names - polars can't list partitions without opening every file. """
+        settings = asset.settings.partition
+        if settings is None:
+            return []
+        keys = {
+            PartitionKey.from_relative_path(settings, part.parent.relative_to(self.asset_dir(asset)))
+            for part in self.existing_parts(asset)
+        }
+        return sorted((key for key in keys if key is not None), key=lambda key: str(key.relative_path()))
+
+    def layout_matches(self, asset: Asset) -> bool:
+        """ False if existing files sit where the asset's current partition settings wouldn't put
+        them, e.g. it was partitioned since they were written. Polars can't read a mix. """
+        parts = {path for path in self._own_files(self.asset_dir(asset)) if path.suffix == f".{self.extension}"}
+        return parts == self.existing_parts(asset)
 
     def asset_dir(self, asset: Asset) -> Path:
         return asset.base_storage_path_with_schema / asset.name
+
+    def partition_dir(self, asset: Asset, partition: PartitionKey | None) -> Path:
+        directory = self.asset_dir(asset)
+        return directory / partition.relative_path() if partition else directory
+
+    def _leaf_partitions(self, asset: Asset, partition: PartitionKey | None) -> list[PartitionKey]:
+        """ Every existing leaf partition under `partition`, which may be a prefix. """
+        return [
+            key for key in self.existing_partitions(asset)
+            if partition is None or key.prefix(len(partition)) == partition
+        ]
+
+    # Pending: promoted from staging, not yet swept into the canonical set by a `consolidate`.
+    # Zero-padded so that parts from the same run sort in the order they were written, which
+    # `keep="last"` relies on.
+    def _pending_name(self, run_id: str, number: int) -> str:
+        return f"run-{run_id}-part-{number:06d}.{self.extension}"
+
+    def _chunk_name(self, chunk_number: int) -> str:
+        return f"chunk-{chunk_number:06d}.{self.extension}"
+
+    @classmethod
+    def _own_files(cls, directory: Path) -> Iterator[Path]:
+        """ Files in `directory` and its `k=v` subdirectories. Other subdirectories aren't this
+        asset's: one named after it in `schemas` keeps its assets in here too. """
+        if not directory.is_dir():
+            return
+        for path in directory.iterdir():
+            if path.is_file():
+                yield path
+            elif "=" in path.name:
+                yield from cls._own_files(path)
+
+    @classmethod
+    def _delete_under(cls, directory: Path, keep: Callable[[Path], bool]) -> None:
+        """ Deletes each file `_own_files` would find that `keep` rejects, then the `k=v`
+        directories that leaves empty. """
+        if not directory.is_dir():
+            return
+        for path in list(directory.iterdir()):
+            if path.is_file():
+                if not keep(path):
+                    path.unlink()
+            elif "=" in path.name:
+                cls._delete_under(path, keep)
+                if not any(path.iterdir()):
+                    path.rmdir()
+
+    @staticmethod
+    def _remove_empty_dirs(directory: Path, stop: Path) -> None:
+        """ Removes `directory`, then each parent below `stop`, while they're empty. """
+        while directory != stop and directory.is_relative_to(stop) and directory.is_dir() and not any(directory.iterdir()):
+            directory.rmdir()
+            directory = directory.parent
 
 
 class PolarsPartitionedStorage[ConfigType](
     StorageConcrete[pl.LazyFrame, pl.DataFrame | pl.LazyFrame, ConfigType]
 ):
-    """ Shared directory-of-parts layout for parquet/arrow/csv: each asset gets its own
-    directory of uniquely-named part files. Formats differ only in `extension` and their
-    read/write/scan functions. """
-
-    # A plain class attribute, not an abstract `@property` - each format subclass sets this
-    # directly (`extension = "parquet"`), which pyright can only check against a plain
-    # attribute's declared type, not a property's.
-    extension: str
+    """ Parquet/arrow/csv: formats differ only in `extension` and their read/write/scan functions.
+    Partition key columns are kept inside the files as well as in the directory names. """
 
     @abstractmethod
-    def scan(self, glob_path: Path) -> pl.LazyFrame:
+    def scan(self, source: Path | list[Path], hive_schema: dict[str, pl.DataType] | None) -> pl.LazyFrame:
+        """ `hive_schema` is `None` for an unpartitioned asset. """
         raise NotImplementedError()
 
     @abstractmethod
@@ -187,18 +342,9 @@ class PolarsPartitionedStorage[ConfigType](
     def sink(self, lf: pl.LazyFrame, path: Path | pl.PartitionBy) -> None:
         raise NotImplementedError()
 
-    def part_glob(self, asset: Asset) -> Path:
-        return self.asset_dir(asset) / f"*.{self.extension}"
-
-    # Pending: written by `save`, not yet swept into the canonical set by a `consolidate`.
-    # Named `run-{run_id}-part-{number}` - one `run_id` per `materialize()` call, `number`
-    # zero-padded since multiple chunks under the *same* run_id must still sort correctly
-    # relative to each other for `keep="last"` to mean "most recent".
-    def _pending_name(self, run_id: str, number: int) -> str:
-        return f"run-{run_id}-part-{number:06d}.{self.extension}"
-
-    def _pending_staged_name(self, run_id: str, number: int) -> str:
-        return f"{self._pending_name(run_id, number)}.tmp"
+    def scan_asset(self, asset: Asset, source: Path | list[Path]) -> pl.LazyFrame:
+        settings = asset.settings.partition
+        return self.scan(source, settings.hive_schema if settings else None)
 
     # Canonical: the current consolidated set, named plainly `part-{number}` - every
     # `consolidate` call fully regenerates this whole set from 1, so there's nothing for a
@@ -206,48 +352,67 @@ class PolarsPartitionedStorage[ConfigType](
     def _canonical_name(self, number: int) -> str:
         return f"part-{number}.{self.extension}"
 
-    def clear(self, asset: Asset) -> None:
-        shutil.rmtree(self.asset_dir(asset), ignore_errors=True)
-
-    def existing_parts(self, asset: Asset) -> set[Path]:
-        directory = self.asset_dir(asset)
-        return set(directory.glob(f"*.{self.extension}")) if directory.exists() else set()
-
-    def save(
-            self, config: ConfigType, asset: Asset, obj: pl.DataFrame | pl.LazyFrame,
-            run_id: str, part_number: int,
-    ) -> None:
+    def stage(
+            self, config: ConfigType, asset: Asset, obj: pl.DataFrame | pl.LazyFrame, directory: Path,
+            chunk_number: int, partition: Mapping[str, Any] | None = None,
+    ) -> set[PartitionKey]:
         if not isinstance(obj, (pl.DataFrame, pl.LazyFrame)):
             raise TypeError(
                 f"asset {asset.name!r} returned {type(obj).__name__!r}, but its storage "
                 f"({type(self).__name__!r}) only persists a polars DataFrame/LazyFrame"
             )
 
-        directory = self.asset_dir(asset)
-        directory.mkdir(parents=True, exist_ok=True)
-        staged_path = directory / self._pending_staged_name(run_id, part_number)
-
-        if isinstance(obj, pl.DataFrame):
-            self.write(obj, staged_path)
+        was_eager = isinstance(obj, pl.DataFrame)
+        settings = asset.settings.partition
+        if settings is None:
+            if partition is not None:
+                raise ValueError(f"asset {asset.name!r} isn't partitioned, but was given partition {dict(partition)!r}")
+            target = directory
+            key = None
         else:
-            self.sink(obj, staged_path)
+            if partition is None:
+                raise ValueError(
+                    f"asset {asset.name!r} is partitioned, so each write needs an explicit partition - "
+                    f"yield/return Output(data, partition={{...}})"
+                )
+            key = PartitionKey.from_mapping(settings, partition)
+            obj = _with_key_columns(asset, obj.lazy(), key)
+            target = directory / key.relative_path()
 
-        staged_path.rename(directory / self._pending_name(run_id, part_number))
+        target.mkdir(parents=True, exist_ok=True)
+        path = target / self._chunk_name(chunk_number)
+        if isinstance(obj, pl.LazyFrame):
+            if was_eager:
+                self.write(obj.collect(), path)
+            else:
+                self.sink(obj, path)
+        else:
+            self.write(obj, path)
+        return {key} if key is not None else set()
 
     def load(self, config: ConfigType, asset: Asset) -> pl.LazyFrame:
-        return self.scan(self.part_glob(asset))
+        # Spelled out rather than `**`, which would also pick up assets nested in here by `schemas`
+        settings = asset.settings.partition
+        levels = [f"{name}=*" for name in settings.columns] if settings else []
+        return self.scan_asset(asset, self.asset_dir(asset).joinpath(*levels, f"*.{self.extension}"))
 
     def load_previous(self, config: ConfigType, asset: Asset) -> pl.LazyFrame | None:
         parts = sorted(self.existing_parts(asset))
-        return pl.concat([self.scan(part) for part in parts]) if parts else None
+        return self.scan_asset(asset, parts) if parts else None
 
-    def consolidate(self, config: ConfigType, asset: Asset) -> None:
-        directory = self.asset_dir(asset)
+    def consolidate(self, config: ConfigType, asset: Asset, partition: PartitionKey | None = None) -> None:
+        if asset.settings.partition is None:
+            self._consolidate_dir(config, asset, self.asset_dir(asset))
+            return
+        for key in self._leaf_partitions(asset, partition):
+            self._consolidate_dir(config, asset, self.partition_dir(asset, key))
+
+    def _consolidate_dir(self, config: ConfigType, asset: Asset, directory: Path) -> None:
         old_parts = sorted(directory.glob(f"*.{self.extension}")) if directory.exists() else []
         if not old_parts:
             return
 
-        frame = pl.concat([self.scan(part) for part in old_parts])
+        frame = self.scan_asset(asset, old_parts)
         base_config = cast(BaseStorageConfig, config)
         primary_key = asset.settings.primary_key
         if primary_key is not None:
@@ -301,12 +466,42 @@ class PolarsPartitionedStorage[ConfigType](
                 old_part.unlink()
 
 
+def _with_key_columns(asset: Asset, lf: pl.LazyFrame, key: PartitionKey) -> pl.LazyFrame:
+    """ Adds any of `key`'s columns missing from `lf` (checked against the declared dtypes), and -
+    for columns already present - checks their values agree with `key`. A frame whose own column
+    disagrees with the partition it's being written to would otherwise land in a directory its
+    data doesn't match. """
+    settings = cast(PartitionSettings, asset.settings.partition)
+    schema = lf.collect_schema()
+    mismatches: list[pl.Expr] = []
+    for name, dtype in settings.columns.items():
+        if name not in schema:
+            lf = lf.with_columns(pl.lit(key[name], dtype=dtype).alias(name))
+            continue
+        if schema[name] != dtype:
+            if dtype == pl.String and isinstance(schema[name], (pl.Categorical, pl.Enum)):
+                lf = lf.with_columns(pl.col(name).cast(pl.String))
+            else:
+                raise TypeError(
+                    f"asset {asset.name!r}'s partition column {name!r} is {schema[name]!r}, but is declared "
+                    f"as {dtype!r} - cast it first"
+                )
+        # `ne_missing`, not `!=` - a plain inequality is null if the column's value is null,
+        # which `filter()` drops as "not a mismatch" instead of flagging it as one.
+        mismatches.append(pl.col(name).ne_missing(pl.lit(key[name], dtype=dtype)))
+
+    if mismatches and not lf.filter(pl.any_horizontal(mismatches)).limit(1).collect().is_empty():
+        raise ValueError(f"asset {asset.name!r} was given partition {dict(key)!r}, but its own columns disagree with it")
+    return lf
+
+
 # PARQUET
 class ParquetPolars(PolarsPartitionedStorage[ParquetStorageConfig]):
     extension = "parquet"
 
-    def scan(self, glob_path: Path) -> pl.LazyFrame:
-        return pl.scan_parquet(glob_path)
+    def scan(self, source: Path | list[Path], hive_schema: dict[str, pl.DataType] | None) -> pl.LazyFrame:
+        # Polars only turns hive on by itself for a bare directory, not a glob or a list of files.
+        return pl.scan_parquet(source, hive_partitioning=hive_schema is not None, hive_schema=hive_schema)
 
     def write(self, df: pl.DataFrame, path: Path) -> None:
         df.write_parquet(path)
@@ -323,8 +518,8 @@ class ParquetPolars(PolarsPartitionedStorage[ParquetStorageConfig]):
 class ArrowPolars(PolarsPartitionedStorage[ArrowStorageConfig]):
     extension = "arrow"  # TODO is this the right extension?
 
-    def scan(self, glob_path: Path) -> pl.LazyFrame:
-        return pl.scan_ipc(glob_path)
+    def scan(self, source: Path | list[Path], hive_schema: dict[str, pl.DataType] | None) -> pl.LazyFrame:
+        return pl.scan_ipc(source, hive_partitioning=hive_schema is not None, hive_schema=hive_schema)
 
     def write(self, df: pl.DataFrame, path: Path) -> None:
         df.write_ipc(path)
@@ -341,8 +536,13 @@ class ArrowPolars(PolarsPartitionedStorage[ArrowStorageConfig]):
 class CsvPolars(PolarsPartitionedStorage[CsvStorageConfig]):
     extension = "csv"
 
-    def scan(self, glob_path: Path) -> pl.LazyFrame:
-        return pl.scan_csv(glob_path)
+    def scan(self, source: Path | list[Path], hive_schema: dict[str, pl.DataType] | None) -> pl.LazyFrame:
+        if hive_schema is None:
+            return pl.scan_csv(source)
+        # No hive support for csv, so key columns come from the files. Read them as text first,
+        # otherwise csv inference would turn "007" into 7.
+        lf = pl.scan_csv(source, schema_overrides={name: pl.String for name in hive_schema})
+        return lf.with_columns(_parse_text(name, dtype) for name, dtype in hive_schema.items())
 
     def write(self, df: pl.DataFrame, path: Path) -> None:
         df.write_csv(path)
@@ -355,62 +555,77 @@ class CsvPolars(PolarsPartitionedStorage[CsvStorageConfig]):
         return CsvStorageConfig
 
 
+def _parse_text(name: str, dtype: pl.DataType) -> pl.Expr:
+    column = pl.col(name)
+    if dtype == pl.Date:
+        return column.str.to_date("%Y-%m-%d")
+    if dtype == pl.Boolean:
+        return column == "true"
+    return column.cast(dtype)
+
+
 # LGBM
-class LGBMModelStorage(StorageConcrete[LGBMReturnType, LGBMReturnType, LGBMStorageConfig]):
-    """ A single trained model per asset, not a directory of rows - but the same pending-name
-    `.tmp`-then-rename atomicity. `Mode.OVERWRITE` is the only mode `LGBMStorageConfig` allows. """
+class LGBMModelStorage(StorageConcrete[LGBMModel, LGBMModel, LGBMStorageConfig]):
+    """ One pickled model per asset, or per partition. `load` returns the latest one, or for a
+    partitioned asset a dict of the latest per partition. """
 
-    def _pending_name(self, run_id: str) -> str:
-        return f"run-{run_id}-model.pkl"
-
-    def _pending_staged_name(self, run_id: str) -> str:
-        return f"{self._pending_name(run_id)}.tmp"
+    extension = "pkl"
 
     @property
     def config_type(self) -> type[LGBMStorageConfig]:
         return LGBMStorageConfig
 
-    def clear(self, asset: Asset) -> None:
-        shutil.rmtree(self.asset_dir(asset), ignore_errors=True)
-
-    def existing_parts(self, asset: Asset) -> set[Path]:
-        directory = self.asset_dir(asset)
-        return set(directory.glob("*.pkl")) if directory.exists() else set()
-
-    def save(
-            self, config: LGBMStorageConfig, asset: Asset, obj: LGBMReturnType,
-            run_id: str, part_number: int,
-    ) -> None:
+    def stage(
+            self, config: LGBMStorageConfig, asset: Asset, obj: LGBMModel, directory: Path,
+            chunk_number: int, partition: Mapping[str, Any] | None = None,
+    ) -> set[PartitionKey]:
         if not isinstance(obj, (LGBMClassifier, LGBMRegressor, LGBMRanker)):
             raise TypeError(
                 f"asset {asset.name!r} returned {type(obj).__name__!r}, but its storage "
                 f"(LGBMModelStorage) only persists a trained LGBM model"
             )
 
-        directory = self.asset_dir(asset)
-        directory.mkdir(parents=True, exist_ok=True)
-        staged_path = directory / self._pending_staged_name(run_id)
+        settings = asset.settings.partition
+        if settings is None:
+            if partition is not None:
+                raise ValueError(f"asset {asset.name!r} isn't partitioned, but was given partition {dict(partition)!r}")
+            key = None
+        elif partition is None:
+            raise ValueError(
+                f"asset {asset.name!r} is a partitioned model, so each model needs a key: "
+                f"yield Output(model, partition={{...}})"
+            )
+        else:
+            key = PartitionKey.from_mapping(settings, partition)
 
-        with staged_path.open("wb") as file:
+        target = directory / key.relative_path() if key else directory
+        target.mkdir(parents=True, exist_ok=True)
+        with (target / self._chunk_name(chunk_number)).open("wb") as file:
             pickle.dump(obj, file)
+        return {key} if key else set()
 
-        staged_path.rename(directory / self._pending_name(run_id))
-
-    def load(self, config: LGBMStorageConfig, asset: Asset) -> LGBMReturnType:
-        parts = sorted(self.existing_parts(asset))
-        if not parts:
+    def load(self, config: LGBMStorageConfig, asset: Asset) -> Any:
+        loaded = self.load_previous(config, asset)
+        if loaded is None:
             raise FileNotFoundError(f"no model has been written yet for asset {asset.name!r}")
-        with parts[-1].open("rb") as file:
+        return loaded
+
+    def load_previous(self, config: LGBMStorageConfig, asset: Asset) -> Any:
+        if asset.settings.partition is None:
+            parts = sorted(self.existing_parts(asset))
+            return self._unpickle(parts[-1]) if parts else None
+        models = {
+            key: self._unpickle(sorted(self.existing_parts(asset, key))[-1])
+            for key in self.existing_partitions(asset)
+        }
+        return models or None
+
+    @staticmethod
+    def _unpickle(path: Path) -> LGBMModel:
+        with path.open("rb") as file:
             return pickle.load(file)
 
-    def load_previous(self, config: LGBMStorageConfig, asset: Asset) -> LGBMReturnType | None:
-        parts = sorted(self.existing_parts(asset))
-        if not parts:
-            return None
-        with parts[-1].open("rb") as file:
-            return pickle.load(file)
-
-    def consolidate(self, config: LGBMStorageConfig, asset: Asset) -> None:
+    def consolidate(self, config: LGBMStorageConfig, asset: Asset, partition: PartitionKey | None = None) -> None:
         raise NotImplementedError(
             "a model has no parts to compact - LGBMStorageConfig only supports Mode.OVERWRITE, "
             "which never calls consolidate()"
@@ -449,7 +664,7 @@ def get_storage_concrete(config: StorageConfig) -> StorageConcrete[Any, Any, Any
     return STORAGE_TYPE_MAPPINGS[storage_type]()
 
 
-def consolidate(config: StorageConfig, asset: Asset) -> None:
-    """ Compacts (and dedupes, per `primary_key`/`is_duplicate`) every part file for `asset`,
+def consolidate(config: StorageConfig, asset: Asset, partition: PartitionKey | None = None) -> None:
+    """ Compacts (and dedupes, per `primary_key`/`is_duplicate`) the part files for `asset`,
     per `config.max_rows_per_file`. """
-    get_storage_concrete(config).consolidate(config, asset)
+    get_storage_concrete(config).consolidate(config, asset, partition)
