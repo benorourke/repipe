@@ -4,7 +4,6 @@ from sklearn.datasets import load_iris
 
 from repipe import Repipe
 from repipe.asset import AssetContext, MultiAssetOut, Output, PartitionSettings, asset, multi_asset
-from repipe.storage import LGBMStorageConfig
 
 
 @asset(schemas=["source"])
@@ -54,7 +53,6 @@ def iris_split(context: AssetContext, iris_renamed: pl.DataFrame) -> dict[str, p
 @asset(
     dependencies=["iris_train"],
     schemas=["mart"],
-    storage=LGBMStorageConfig(),
 )
 def iris_model(context: AssetContext, iris_train: pl.DataFrame) -> LGBMClassifier:
     """ Step 4: train an LGBM model on the training rows. """

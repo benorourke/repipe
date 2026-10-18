@@ -11,6 +11,7 @@ from repipe.storage.storage import (
     consolidate,
     get_storage_concrete,
     make_default_storage_config,
+    resolve_storage_config,
 )
 
 __all__ = [
@@ -26,4 +27,5 @@ __all__ = [
     "consolidate",
     "get_storage_concrete",
     "make_default_storage_config",
+    "resolve_storage_config",
 ]

@@ -12,13 +12,12 @@ from pydantic import BaseModel, field_validator, model_validator
 
 from repipe.asset.partition import PartitionSettings
 from repipe.storage import (
-    BaseStorageConfig,
     LGBMModel,
     LGBMStorageConfig,
     Mode,
     StorageType,
     StorageConfig,
-    make_default_storage_config,
+    resolve_storage_config,
 )
 from repipe.testing.data_quality import DataQualityTest
 
@@ -176,7 +175,7 @@ def asset(func: AssetFunc) -> AssetFunc: ...
 def asset(
         func: None = None,
         *,
-        storage: StorageType | StorageConfig = StorageType.PARQUET,
+        storage: StorageType | StorageConfig | None = None,
         primary_key: PrimaryKey | None = None,
         schemas: list[str] | None = None,
         dependencies: list[str] | list[Dependency] | None = None,
@@ -189,7 +188,7 @@ def asset(
 def asset(
         func: AssetFunc | None = None,
         *,
-        storage: StorageType | StorageConfig = StorageType.PARQUET,
+        storage: StorageType | StorageConfig | None = None,
         primary_key: PrimaryKey | None = None,
         schemas: list[str] | None = None,
         dependencies: list[str] | list[Dependency] | None = None,
@@ -215,19 +214,46 @@ def asset(
 
 def _resolve_settings(
         inner_func: AssetFunc, is_multi: bool, *,
-        storage: StorageType | StorageConfig, primary_key: PrimaryKey | None, schemas: list[str] | None,
+        storage: StorageType | StorageConfig | None, primary_key: PrimaryKey | None, schemas: list[str] | None,
         labels: frozenset[str], partition: PartitionSettings | None, tests: Sequence[DataQualityTest] | None,
         is_required: bool,
 ) -> AssetSettings:
     """ Builds one output's `AssetSettings`, shared by `@asset` and `@multi_asset` - each just
     supplies the same per-output kwargs, `@asset`'s own or one `MultiAssetOut`'s. """
-    resolved_storage = storage if isinstance(storage, BaseStorageConfig) else make_default_storage_config(storage)
+    # A multi-asset's annotation (`dict[str, ...]`, `Output`s) doesn't say what each output is
+    annotation = inspect.Signature.empty if is_multi else _return_annotation(inner_func)
+    resolved_storage = resolve_storage_config(storage, annotation)
     if not is_multi:  # a multi-asset writes every output through `Output`, whatever its shape
         resolved_storage.check_compatible(inner_func, partition)
     return AssetSettings(
         storage=resolved_storage, primary_key=primary_key, schemas=schemas, labels=labels,
         partition=partition, tests=tests, is_required=is_required,
     )
+
+
+def _return_annotation(func: Callable) -> object:
+    """ Just the `return` annotation (`inspect.Signature.empty` if absent/unresolvable). Not
+    `get_type_hints(func)`: that raises if any *parameter* annotation is unresolvable, which
+    would lose a perfectly good return type. """
+    annotation = inspect.get_annotations(func, eval_str=False).get("return", inspect.Signature.empty)
+    if isinstance(annotation, str):
+        try:
+            annotation = eval(annotation, getattr(func, "__globals__", {}))
+        except Exception:
+            return inspect.Signature.empty
+    # The catch-all alias means "unknown", not "ambiguous"; an `Output` says nothing about what
+    # it wraps (a partitioned model asset must set `storage=`).
+    if annotation is AssetReturnType or _mentions_output(annotation):
+        return inspect.Signature.empty
+    return annotation
+
+
+def _mentions_output(annotation: object) -> bool:
+    if annotation is Output:
+        return True
+    if isinstance(annotation, typing.TypeAliasType):
+        return _mentions_output(annotation.__value__)
+    return any(_mentions_output(arg) for arg in typing.get_args(annotation))
 
 
 def _register(
