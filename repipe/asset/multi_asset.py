@@ -10,7 +10,7 @@ from repipe.testing.data_quality import DataQualityTest
 @dataclass(frozen=True, kw_only=True)
 class MultiAssetOut:
     """ One output of a `@multi_asset`, taking the same per-output settings as `@asset`. """
-    storage: StorageType | StorageConfig = StorageType.PARQUET
+    storage: StorageType | StorageConfig | None = None
     primary_key: PrimaryKey | None = None
     schemas: list[str] | None = None
     labels: Sequence[str] = field(default_factory=list)

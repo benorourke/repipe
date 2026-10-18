@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import abc
+import collections.abc as cabc
 import enum
 import inspect
 import itertools
 import pickle
+import types
+import typing
 import uuid
+import warnings
 from abc import abstractmethod
 from collections.abc import Iterator, Mapping, Set as AbstractSet
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, cast, overload
+from typing import TYPE_CHECKING, Annotated, Any, AsyncIterator, Callable, Generator, cast, overload
 
+import duckdb
 import polars as pl
 from lightgbm import LGBMClassifier, LGBMRanker, LGBMRegressor
 from pydantic import BaseModel, model_validator
@@ -93,7 +98,8 @@ class LGBMStorageConfig(BaseStorageConfig):
         # unpartitioned one has to return a single model.
         if partition is None and (inspect.isgeneratorfunction(inner_func) or inspect.isasyncgenfunction(inner_func)):
             raise ValueError(
-                f"asset {inner_func.__name__!r} is a generator but uses LGBMStorageConfig - "
+                f"asset {inner_func.__name__!r} is a generator but uses LGBMStorageConfig (possibly "
+                f"inferred from its return annotation; override with `storage=`) - "
                 f"a trained model has no per-chunk parts to write; return a single model instead"
             )
 
@@ -113,6 +119,79 @@ def make_default_storage_config(storage_type: StorageType) -> StorageConfig:
             return LGBMStorageConfig()
         case _:
             raise NotImplementedError()
+
+
+_LGBM_TYPES = (LGBMClassifier, LGBMRegressor, LGBMRanker)
+_FRAME_TYPES = (pl.DataFrame, pl.LazyFrame, duckdb.DuckDBPyRelation)
+_ITERATOR_ORIGINS = (
+    typing.Iterator, AsyncIterator, Generator,
+    cabc.Iterator, cabc.AsyncIterator, cabc.Generator,
+)
+# Origins that can't be a single frame/model but are legitimate return shapes (e.g. a
+# multi-asset's `dict`), so falling back to Parquet for them isn't worth a warning.
+_SILENT_FALLBACK_ORIGINS = (list, dict, tuple)
+
+
+def _leaf_types(annotation: object) -> list[object]:
+    """ Flattens a return annotation to the concrete types it could produce. """
+    if isinstance(annotation, typing.TypeAliasType):
+        return _leaf_types(annotation.__value__)
+    origin = typing.get_origin(annotation)
+    if origin is Annotated:
+        return _leaf_types(typing.get_args(annotation)[0])
+    if origin in (typing.Union, types.UnionType):
+        return [
+            leaf for arg in typing.get_args(annotation) if arg is not type(None)
+            for leaf in _leaf_types(arg)
+        ]
+    if origin in _ITERATOR_ORIGINS:
+        return _leaf_types(typing.get_args(annotation)[0])
+    return [annotation]
+
+
+def _infer_storage_type(annotation: object) -> StorageType | None:
+    """ `None` if the annotation isn't (only) types we recognise. Raises if it mixes a model
+    and a frame, since either could be what the user means. """
+    kinds: set[StorageType] = set()
+    for leaf in _leaf_types(annotation):
+        if isinstance(leaf, type) and issubclass(leaf, _LGBM_TYPES):
+            kinds.add(StorageType.LGBM)
+        elif isinstance(leaf, type) and issubclass(leaf, _FRAME_TYPES):
+            kinds.add(StorageType.PARQUET)
+        else:
+            return None
+    if len(kinds) > 1:
+        raise TypeError(
+            f"return annotation {annotation!r} mixes a model and a frame - "
+            f"pass `storage=` explicitly to say which to persist"
+        )
+    return next(iter(kinds), None)
+
+
+def resolve_storage_config(
+        storage: StorageType | StorageConfig | None,
+        annotation: object = inspect.Signature.empty,
+) -> StorageConfig:
+    """ An explicit `storage` wins; otherwise infers from the return `annotation`; otherwise
+    Parquet. `annotation` is `inspect.Signature.empty` when absent. """
+    if isinstance(storage, BaseStorageConfig):
+        return storage
+    if storage is not None:
+        return make_default_storage_config(storage)
+
+    if annotation is inspect.Signature.empty:
+        return make_default_storage_config(StorageType.PARQUET)
+
+    inferred = _infer_storage_type(annotation)
+    if inferred is None:
+        if annotation not in (None, Any) and typing.get_origin(annotation) not in _SILENT_FALLBACK_ORIGINS:
+            warnings.warn(
+                f"unrecognised return annotation {annotation!r}; defaulting to Parquet storage - "
+                f"pass `storage=` to choose another",
+                stacklevel=4,
+            )
+        inferred = StorageType.PARQUET
+    return make_default_storage_config(inferred)
 
 
 def staging_root(base_storage_path: Path) -> Path:
@@ -359,7 +438,8 @@ class PolarsPartitionedStorage[ConfigType](
         if not isinstance(obj, (pl.DataFrame, pl.LazyFrame)):
             raise TypeError(
                 f"asset {asset.name!r} returned {type(obj).__name__!r}, but its storage "
-                f"({type(self).__name__!r}) only persists a polars DataFrame/LazyFrame"
+                f"({type(self).__name__!r}) only persists a polars DataFrame/LazyFrame - pass `storage=` "
+                f"(or, for a plain `@asset`, annotate the return type e.g. `-> LGBMClassifier`)"
             )
 
         was_eager = isinstance(obj, pl.DataFrame)
@@ -582,7 +662,8 @@ class LGBMModelStorage(StorageConcrete[LGBMModel, LGBMModel, LGBMStorageConfig])
         if not isinstance(obj, (LGBMClassifier, LGBMRegressor, LGBMRanker)):
             raise TypeError(
                 f"asset {asset.name!r} returned {type(obj).__name__!r}, but its storage "
-                f"(LGBMModelStorage) only persists a trained LGBM model"
+                f"(LGBMModelStorage) only persists a trained LGBM model - pass `storage=` "
+                f"(or, for a plain `@asset`, annotate the return type)"
             )
 
         settings = asset.settings.partition
