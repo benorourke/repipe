@@ -232,9 +232,6 @@ def _resolve_settings(
 
 
 def _return_annotation(func: Callable) -> object:
-    """ Just the `return` annotation (`inspect.Signature.empty` if absent/unresolvable). Not
-    `get_type_hints(func)`: that raises if any *parameter* annotation is unresolvable, which
-    would lose a perfectly good return type. """
     annotation = inspect.get_annotations(func, eval_str=False).get("return", inspect.Signature.empty)
     if isinstance(annotation, str):
         try:
