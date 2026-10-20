@@ -109,7 +109,7 @@ async def materialize_function(
     try:
         async for write in _iter_writes(function, kwargs):
             session.stage(write.asset, _duckdb_relation_to_polars(write.data), write.partition)
-        session.commit()
+        session.finish()
     except BaseException:
         session.abort()
         raise
