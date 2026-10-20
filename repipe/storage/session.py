@@ -13,8 +13,9 @@ if TYPE_CHECKING:
 
 
 class WriteSession:
-    """ Collects one run of an asset function's writes in a staging directory, so nothing is
-    visible until `commit` - a run that fails part way leaves the previous output untouched. """
+    """ Commits each write into its asset's directory as soon as it's staged - a chunk is durable
+    and visible the moment it's yielded, so a run that fails part way keeps everything it already
+    wrote rather than losing it. """
 
     def __init__(self, assets: Sequence[Asset], run_id: str, is_multi: bool):
         self.assets = {asset.name: asset for asset in assets}
@@ -30,7 +31,8 @@ class WriteSession:
 
     def stage(self, asset_name: str, data: Any, partition: Mapping[str, Any] | None = None) -> None:
         asset = self.assets[asset_name]
-        storage = get_storage_concrete(asset.settings.storage)
+        config = asset.settings.storage
+        storage = get_storage_concrete(config)
         directory = self.root / asset_name
         if asset_name not in self._chunks:
             self._check_layout(asset)
@@ -39,36 +41,32 @@ class WriteSession:
         self._check_staging_exists(asset_name)
         self._chunks[asset_name] = self._chunks.get(asset_name, 0) + 1
 
-        written = storage.stage(
-            asset.settings.storage, asset, data, directory, self._chunks[asset_name], partition,
-        )
+        written = storage.stage(config, asset, data, directory, self._chunks[asset_name], partition)
         partitions = self._partitions.setdefault(asset_name, set())
         partitions |= written
         if written:
             self._check_case_clashes(asset, partitions)
 
-    def commit(self) -> None:
-        for asset in self.assets.values():
-            if asset.name not in self._chunks and asset.settings.is_required and self.is_multi:
-                raise ValueError(f"asset function didn't write its required output {asset.name!r}")
-            if asset.name in self._chunks:
-                self._check_staging_exists(asset.name)
+        storage.commit(config, asset, directory, self.run_id, written)
 
+    def finish(self) -> None:
+        """ Called once the asset function is done yielding. A required output of a multi-asset
+        that never received a write fails the run - whatever other outputs it did write are
+        already durable regardless. A single (non-multi) asset that wrote nothing still commits
+        empty, so OVERWRITE leaves it empty, as it always has. """
         for asset in self.assets.values():
-            # An unwritten output of a multi-asset is left alone. A single asset that wrote
-            # nothing still commits, so OVERWRITE leaves it empty, as it always has.
-            if asset.name in self._chunks or not self.is_multi:
-                self._commit(asset)
+            if asset.name in self._chunks:
+                continue
+            if self.is_multi:
+                if asset.settings.is_required:
+                    raise ValueError(f"asset function didn't write its required output {asset.name!r}")
+                continue
+            config = asset.settings.storage
+            get_storage_concrete(config).commit(config, asset, self.root / asset.name, self.run_id, set())
         self.abort()
 
     def abort(self) -> None:
         shutil.rmtree(self.root, ignore_errors=True)
-
-    def _commit(self, asset: Asset) -> None:
-        config = asset.settings.storage
-        storage = get_storage_concrete(config)
-        partitions = self._partitions.get(asset.name, set())
-        storage.commit(config, asset, self.root / asset.name, self.run_id, partitions)
 
     def _check_staging_exists(self, asset_name: str) -> None:
         # Otherwise what was staged is lost, and OVERWRITE would replace the asset with what's left

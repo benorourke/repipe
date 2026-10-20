@@ -266,16 +266,16 @@ class StorageConcrete[LoadType, SaveType, ConfigType](abc.ABC):
         raise NotImplementedError()
 
     def promote(self, asset: Asset, directory: Path, run_id: str) -> None:
-        """ Moves every staged file into the asset directory, numbered in staging order so that
-        later chunks of a run sort after earlier ones. """
+        """ Moves every staged file into the asset directory, reusing each one's own chunk number
+        (not renumbering from 1) so that a chunk promoted on its own - one write session promotes
+        once per chunk, as soon as it's yielded, rather than once for the whole run - never
+        collides with one promoted earlier or later in the same run. """
         staged = sorted(directory.rglob(f"*.{self.extension}")) if directory.exists() else []
-        numbers: dict[Path, itertools.count[int]] = {}
         for path in staged:
             target = self.asset_dir(asset) / path.parent.relative_to(directory)
-            if target not in numbers:
-                target.mkdir(parents=True, exist_ok=True)
-                numbers[target] = itertools.count(1)
-            path.rename(target / self._pending_name(run_id, next(numbers[target])))
+            target.mkdir(parents=True, exist_ok=True)
+            number = int(path.stem.removeprefix("chunk-"))
+            path.rename(target / self._pending_name(run_id, number))
 
     def commit(
             self, config: ConfigType, asset: Asset, staged_dir: Path, run_id: str,
