@@ -1,3 +1,3 @@
-from repipe.project import Repipe
+from repipe.project import Repipe, load
 
-__all__ = ["Repipe"]
+__all__ = ["Repipe", "load"]

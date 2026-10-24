@@ -3,12 +3,13 @@ import sys
 import tomllib
 from pathlib import Path
 from types import ModuleType
-from typing import Callable, Mapping
+from typing import Any, Callable, Mapping
 
 from frozendict import frozendict
 from pydantic import BaseModel
 
 from repipe.asset.asset import Asset, AssetFunction, RegisteredAssetFunction
+from repipe.storage import get_storage_concrete
 
 
 class Repipe:
@@ -133,3 +134,20 @@ def load_app(project_root: Path | None = None) -> tuple[Path, ModuleType, Repipe
         raise ValueError(f"{module.__file__} defines multiple Repipe objects - expected exactly one.")
 
     return root, module, apps[0]
+
+
+def load(*names: str) -> Any:
+    """ Loads one or more assets by name. """
+    if not names:
+        raise ValueError("load() needs at least one asset name")
+
+    _, _, app = load_app()
+    values = tuple(_load_one(app, name) for name in names)
+    return values[0] if len(values) == 1 else values
+
+
+def _load_one(app: Repipe, name: str) -> Any:
+    asset = app.assets.get(name)
+    if asset is None:
+        raise KeyError(f"no asset named {name!r} - known assets: {sorted(app.assets)}")
+    return get_storage_concrete(asset.settings.storage).load(asset.settings.storage, asset)
