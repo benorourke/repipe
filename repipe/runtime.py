@@ -2,6 +2,7 @@ import inspect
 import itertools
 import types
 import typing
+from collections import Counter
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Iterable, Iterator, Mapping, cast
@@ -14,7 +15,13 @@ from repipe.asset.asset import Asset, AssetContext, AssetFunction, Output
 from repipe.cli.selector import GraphNode, NodeKind, ResourceQuery, topologically_sorted
 from repipe.storage import get_storage_concrete
 from repipe.storage.session import WriteSession
-from repipe.testing.data_quality import RegisteredDataQualityTest
+from repipe.testing.data_quality import (
+    DataQualityError,
+    DataQualityResult,
+    DataQualityStatus,
+    FailType,
+    RegisteredDataQualityTest,
+)
 
 # Disambiguates two `new_run_id()` calls landing in the same millisecond
 _run_id_counter = itertools.count(1)
@@ -38,13 +45,13 @@ class Runtime(BaseModel):
         graph's dependency order. """
         return topologically_sorted(self.graph, self.selection.resolve(self.graph))
 
-    def tests_for_asset(self, asset_name: str) -> dict[str, RegisteredDataQualityTest]:
-        """ The tests directly attached to this one asset, regardless of `selection` - used by
-        `build` to run a materialized asset's own tests right after it runs. """
+    def tests_for_asset(self, asset_name: str) -> dict[str, GraphNode]:
+        """ The tests declared on this one asset, regardless of `selection` - used by `build` to run a
+        materialized asset's own tests right after it runs. """
         return {
-            node.id: cast(RegisteredDataQualityTest, node.obj)
+            node.id: node
             for node in self.graph.values()
-            if node.kind == NodeKind.TEST and asset_name in node.upstream
+            if node.kind == NodeKind.TEST and node.attached_to == asset_name
         }
 
 
@@ -55,21 +62,33 @@ async def run(runtime: Runtime) -> None:
 
 
 async def build(runtime: Runtime) -> None:
-    """ Materializes the selected assets, in dependency order, running each asset's own
-    attached tests immediately after it materializes - repipe `build`. """
+    """ Materializes the selected assets, in dependency order, running each asset's own attached tests as soon as
+    everything they take has materialized - repipe `build`. A failed `FailType.FAIL` test stops the job there. """
+    selected = {node.id for node in runtime.selected_nodes() if node.kind == NodeKind.ASSET}
+    materialized: set[str] = set()
+    waiting: dict[str, GraphNode] = {}
+    results: list[DataQualityResult] = []
     async for function in _materialize_selected(runtime):
+        materialized.update(function.outputs)
         for asset_name in function.outputs:
-            for test_id, test in runtime.tests_for_asset(asset_name).items():
-                run_test(test_id, test)
+            waiting.update(runtime.tests_for_asset(asset_name))
+        # a test taking several assets waits for the rest of them, if they're being built in this run too
+        for test_id, node in list(waiting.items()):
+            if all(dep in materialized or dep not in selected for dep in node.upstream):
+                del waiting[test_id]
+                _check(node, runtime.graph, results)
+    _print_summary(results)
 
 
 async def test(runtime: Runtime) -> None:
-    """ Runs the selected data quality tests directly, independent of materialization, in the
-    combined graph's dependency order (a test never runs before the asset(s) it's attached
-    to) - repipe `test`. """
+    """ Runs the selected data quality tests directly, independent of materialization, in the combined graph's
+    dependency order (a test never runs before the asset(s) it takes) - repipe `test`. A failed `FailType.FAIL`
+    test stops the job there. """
+    results: list[DataQualityResult] = []
     for node in runtime.selected_nodes():
         if node.kind == NodeKind.TEST:
-            run_test(node.id, cast(RegisteredDataQualityTest, node.obj))
+            _check(node, runtime.graph, results)
+    _print_summary(results)
 
 
 async def _materialize_selected(runtime: Runtime) -> AsyncIterator[AssetFunction]:
@@ -250,5 +269,45 @@ def _allows(annotation: object, expected: type) -> bool:
     return False
 
 
-def run_test(test_id: str, test: RegisteredDataQualityTest) -> None:
-    print(test_id)  # TODO: actually invoke test.func and handle fail_type
+def run_test(node: GraphNode, graph: dict[str, GraphNode]) -> DataQualityResult:
+    """ Runs one test, giving it each asset it names as a parameter. It fails if it raises or returns any offending
+    rows; nothing it does can stop the rest of the run - that is up to the test's `fail_type`, see `_check`. """
+    test = cast(RegisteredDataQualityTest, node.obj)
+    try:
+        value = test.func(**_resolve_test_inputs(test, graph))
+    except Exception as error:
+        return DataQualityResult.from_error(node.id, test.fail_type, error)
+    return DataQualityResult.from_return(node.id, test.fail_type, value)
+
+
+def _resolve_test_inputs(test: RegisteredDataQualityTest, graph: dict[str, GraphNode]) -> dict[str, Any]:
+    parameters = inspect.signature(test.func).parameters
+    try:
+        annotations = typing.get_type_hints(test.func)
+    except Exception:  # unresolvable forward reference - fall back to the raw annotations
+        annotations = {}
+    return {
+        name: _as_annotated(_load_dependency(name, graph), annotations.get(name, parameter.annotation))
+        for name, parameter in parameters.items()
+        if name in graph
+    }
+
+
+def _check(node: GraphNode, graph: dict[str, GraphNode], results: list[DataQualityResult]) -> None:
+    """ Runs and reports a test. A failed `FailType.FAIL` test raises `DataQualityError`, ending the job. """
+    result = run_test(node, graph)
+    results.append(result)
+    print(result.describe())
+    if not result.passed and result.fail_type == FailType.FAIL:
+        _print_summary(results)
+        raise DataQualityError(results)
+
+
+def _print_summary(results: list[DataQualityResult]) -> None:
+    if not results:
+        return
+    counts = Counter(result.status for result in results)
+    print(
+        f"{len(results)} tests: {counts[DataQualityStatus.PASS]} passed, "
+        f"{counts[DataQualityStatus.WARN]} warned, {counts[DataQualityStatus.FAIL]} failed"
+    )
