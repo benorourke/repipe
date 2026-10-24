@@ -1,6 +1,6 @@
 import asyncio
 import shutil
-from typing import Iterable, Iterator, cast
+from typing import Any, Coroutine, Iterable, Iterator, cast
 
 import typer
 
@@ -14,6 +14,7 @@ from repipe.runtime import run as run_assets
 from repipe.runtime import test as run_tests
 from repipe.storage import consolidate as consolidate_asset, get_storage_concrete
 from repipe.storage.storage import staging_root
+from repipe.testing import DataQualityError
 
 app = typer.Typer()
 
@@ -62,6 +63,15 @@ def _targets(assets: Iterable[Asset], filters: list[str]) -> list[tuple[Asset, l
     return targets
 
 
+def _exit_on_failed_test(job: Coroutine[Any, Any, None]) -> None:
+    """ Runs a job that tests data, exiting non-zero if a `FailType.FAIL` test failed. """
+    try:
+        asyncio.run(job)
+    except DataQualityError as error:
+        typer.echo(f"stopped: {error}", err=True)
+        raise typer.Exit(1) from None
+
+
 @app.callback()
 def main():
     """ repipe - an ML + polars native orchestrator """
@@ -81,7 +91,7 @@ def build(
 ):
     """ Materializes the selected assets, in dependency order, running each asset's own
     tests immediately after it materializes. """
-    asyncio.run(build_assets(_build_runtime(selectors)))
+    _exit_on_failed_test(build_assets(_build_runtime(selectors)))
 
 
 @app.command(name="test")
@@ -94,7 +104,7 @@ def test(
         ),
 ):
     """ Runs the selected data quality tests directly, independent of materialization. """
-    asyncio.run(run_tests(_build_runtime(selectors)))
+    _exit_on_failed_test(run_tests(_build_runtime(selectors)))
 
 
 @app.command(name="consolidate")

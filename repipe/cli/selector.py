@@ -1,3 +1,4 @@
+import inspect
 from collections import defaultdict
 from enum import StrEnum
 from typing import Iterable, Iterator, Mapping, Self
@@ -32,6 +33,9 @@ class GraphNode(BaseModel):
     labels: frozenset[str] = frozenset()
     """ Tests have no labels of their own - they inherit whichever asset they're attached to. """
 
+    attached_to: str | None = None
+    """ For a TEST node, the asset it was declared on. Its `upstream` also holds any other assets it takes. """
+
     obj: Asset | RegisteredDataQualityTest
     """ The underlying object this node represents - the Asset for an ASSET node, or the
     RegisteredDataQualityTest for a TEST node. Kept here so a resolved selection of node ids
@@ -62,12 +66,23 @@ def build_graph(assets: Mapping[str, Asset]) -> dict[str, GraphNode]:
                 id=test_id,
                 kind=NodeKind.TEST,
                 name=registered.name,
-                upstream=frozenset({asset_name}),
+                upstream=frozenset({asset_name, *_asset_parameters(test_id, registered, assets)}),
                 labels=labels,
+                attached_to=asset_name,
                 obj=registered,
             )
 
     return nodes
+
+
+def _asset_parameters(test_id: str, test: RegisteredDataQualityTest, assets: Mapping[str, Asset]) -> list[str]:
+    """ The assets a test takes by parameter name, which it must run after. Anything else it takes is a mistake,
+    caught here rather than when the test is run. """
+    parameters = inspect.signature(test.func).parameters
+    unknown = [name for name, p in parameters.items() if name not in assets and p.default is p.empty]
+    if unknown:
+        raise ValueError(f"test {test_id!r} takes {unknown!r}, which aren't assets - tests are given assets by name")
+    return [name for name in parameters if name in assets]
 
 
 class Selection(BaseModel):
