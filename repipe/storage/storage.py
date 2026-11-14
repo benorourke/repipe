@@ -3,8 +3,11 @@ from __future__ import annotations
 import abc
 import collections.abc as cabc
 import enum
+import glob
 import inspect
 import itertools
+import json
+import os
 import pickle
 import types
 import typing
@@ -74,7 +77,8 @@ class ArrowStorageConfig(BaseStorageConfig):
 
 
 class CsvStorageConfig(BaseStorageConfig):
-    pass
+    """ Text, so the types a frame's columns have are recorded beside the data (see `CsvPolars`) and read back
+    from there. """
 
 
 class LGBMStorageConfig(BaseStorageConfig):
@@ -425,6 +429,10 @@ class PolarsPartitionedStorage[ConfigType](
         settings = asset.settings.partition
         return self.scan(source, settings.hive_schema if settings else None)
 
+    def before_write(self, config: ConfigType, asset: Asset, frame: pl.DataFrame | pl.LazyFrame, directory: Path) -> None:
+        """ Called with exactly what is about to be written (partition columns included) and the asset's
+        staging `directory`, so a format can check it or stage something beside it. """
+
     # Canonical: the current consolidated set, named plainly `part-{number}` - every
     # `consolidate` call fully regenerates this whole set from 1, so there's nothing for a
     # number to disambiguate against other than itself.
@@ -459,6 +467,7 @@ class PolarsPartitionedStorage[ConfigType](
             obj = _with_key_columns(asset, obj.lazy(), key)
             target = directory / key.relative_path()
 
+        self.before_write(config, asset, obj, directory)
         target.mkdir(parents=True, exist_ok=True)
         path = target / self._chunk_name(chunk_number)
         if isinstance(obj, pl.LazyFrame):
@@ -613,9 +622,43 @@ class ArrowPolars(PolarsPartitionedStorage[ArrowStorageConfig]):
 
 
 # CSV
+_CSV_SCHEMA_FILE = "_schema.json"
+""" The recorded schema, in the asset's directory beside the CSV files, and where a chunk's is staged. """
+_CSV_SCHEMA_VERSION = 1
+
+_CSV_SIMPLE_DTYPES: dict[str, pl.DataType] = {
+    name: getattr(pl, name)
+    for name in (
+        "Int8", "Int16", "Int32", "Int64", "UInt8", "UInt16", "UInt32", "UInt64", "Float16", "Float32", "Float64",
+        "Boolean", "String", "Date", "Time", "Categorical", "Null",
+    )
+    if hasattr(pl, name)
+}
+
+type _CsvSchemaRecord = list[list[Any]]
+""" `[[column, {"type": ...}], ...]`: what is stored, in the columns' order. """
+
+
 class CsvPolars(PolarsPartitionedStorage[CsvStorageConfig]):
+    """ Plain CSV that reads back as exactly what was written. A CSV carries no types, so each write's schema is
+    recorded in `_schema.json` beside the files, and goes wherever the directory goes. Reading takes every column as
+    text and parses it by its recorded type, strictly: nothing is inferred, so `"007"` stays a string and a date stays
+    a date. A CSV with no record (hand-placed, or from an earlier repipe) is inferred, as it always was.
+
+    One schema per asset: chunks of a run, and an append (or a partitioned overwrite beside partitions it leaves alone),
+    must match what is already there. A column that is only nulls (`Null`) fits any type. Each chunk of a partitioned
+    run commits on its own, so a partitioned overwrite can't change the schema while other partitions exist, even if
+    the run rewrites all of them: `repipe clear` first. Timezone-aware columns are written as UTC, which keeps the
+    instant exactly (a local offset with seconds, like Kolkata's before 1906, can't be written), and read back into
+    their own zone. """
+
     extension = "csv"
 
+    @property
+    def config_type(self) -> type[CsvStorageConfig]:
+        return CsvStorageConfig
+
+    # Without a recorded schema
     def scan(self, source: Path | list[Path], hive_schema: dict[str, pl.DataType] | None) -> pl.LazyFrame:
         if hive_schema is None:
             return pl.scan_csv(source)
@@ -625,14 +668,250 @@ class CsvPolars(PolarsPartitionedStorage[CsvStorageConfig]):
         return lf.with_columns(_parse_text(name, dtype) for name, dtype in hive_schema.items())
 
     def write(self, df: pl.DataFrame, path: Path) -> None:
-        df.write_csv(path)
+        df.with_columns(self._zones_to_utc(df.schema)).write_csv(path)
 
     def sink(self, lf: pl.LazyFrame, path: Path | pl.PartitionBy) -> None:
-        lf.sink_csv(path)
+        lf.with_columns(self._zones_to_utc(lf.collect_schema())).sink_csv(path)
 
-    @property
-    def config_type(self) -> type[CsvStorageConfig]:
-        return CsvStorageConfig
+    def scan_asset(self, asset: Asset, source: Path | list[Path]) -> pl.LazyFrame:
+        record = self._read_record(self.schema_path(asset))
+        if record is None:
+            return super().scan_asset(asset, source)
+        return self._scan_recorded(asset, source, record)
+
+    def _scan_recorded(self, asset: Asset, source: Path | list[Path], record: _CsvSchemaRecord) -> pl.LazyFrame:
+        schema = {name: self._spec_to_dtype(spec) for name, spec in record}
+        if not (source if isinstance(source, list) else glob.glob(str(source))):
+            return pl.LazyFrame(schema=schema)  # an asset overwritten with nothing: empty, but still of its type
+        raw = pl.scan_csv(source, infer_schema=False)
+        found = raw.collect_schema().names()
+        if set(found) != set(schema):
+            raise ValueError(
+                f"asset {asset.name!r}'s CSV has the columns {found}, but {list(schema)} were recorded when it was "
+                f"written - run `repipe clear {asset.name}` if it was changed by hand"
+            )
+        return raw.with_columns(self._parse_recorded(name, dtype).alias(name) for name, dtype in schema.items())
+
+    def before_write(self, config: CsvStorageConfig, asset: Asset, frame: pl.DataFrame | pl.LazyFrame, directory: Path) -> None:
+        record = self._record_of(asset, frame.collect_schema())
+        staged = directory / _CSV_SCHEMA_FILE
+        previous = self._read_record(staged)
+        if previous is not None:
+            merged = self._merge_records(previous, record)
+            if merged is None:
+                raise ValueError(
+                    f"asset {asset.name!r} wrote chunks with different schemas ({self._describe_schema_change(previous, record)}) "
+                    f"- a CSV asset has one schema"
+                )
+            record = merged
+        directory.mkdir(parents=True, exist_ok=True)
+        self._write_record(staged, record)
+
+    def commit(
+            self, config: CsvStorageConfig, asset: Asset, staged_dir: Path, run_id: str,
+            partitions: AbstractSet[PartitionKey],
+    ) -> None:
+        staged = self._read_record(staged_dir / _CSV_SCHEMA_FILE)
+        if staged is None:  # nothing was written, so an overwrite may have just emptied the asset
+            super().commit(config, asset, staged_dir, run_id, partitions)
+            if not self.existing_parts(asset):
+                self.schema_path(asset).unlink(missing_ok=True)
+            return
+
+        kept = self._kept_parts(config, asset, partitions)
+        record = self._reconcile(asset, kept, staged)
+        # What is kept, and a merge that reads the parts back, need the record to be there first. When this replaces every
+        # part it must not be: a commit that fails part way would leave the old data under a record that isn't its own.
+        record_first = bool(kept) or config.mode == Mode.APPEND_THEN_MERGE
+        if record_first:
+            self._write_record(self.schema_path(asset), record)
+        super().commit(config, asset, staged_dir, run_id, partitions)
+        if not record_first:
+            self._write_record(self.schema_path(asset), record)
+
+    def _kept_parts(self, config: CsvStorageConfig, asset: Asset, partitions: AbstractSet[PartitionKey]) -> list[Path]:
+        """ The parts that are there now and still will be once this commit is done. """
+        settings = asset.settings.partition
+        if config.mode != Mode.OVERWRITE:
+            return sorted(self.existing_parts(asset))
+        if settings is None:
+            return []  # every existing part is replaced
+        directory = self.asset_dir(asset)
+        return sorted(
+            path for path in self.existing_parts(asset)
+            if PartitionKey.from_relative_path(settings, path.parent.relative_to(directory)) not in partitions
+        )
+
+    def _reconcile(self, asset: Asset, kept: list[Path], staged: _CsvSchemaRecord) -> _CsvSchemaRecord:
+        """ The record to write: `staged`, once it is known to fit the parts that stay. """
+        if not kept:
+            return staged
+        stored = self._read_record(self.schema_path(asset))
+        if stored is None:
+            self._check_untyped_parts(asset, kept, staged)
+            return staged
+        merged = self._merge_records(stored, staged)
+        if merged is None:
+            raise ValueError(
+                f"asset {asset.name!r} has existing data written with a different schema "
+                f"({self._describe_schema_change(stored, staged)}) - run `repipe clear {asset.name}` first"
+            )
+        return merged
+
+    def _check_untyped_parts(self, asset: Asset, kept: list[Path], staged: _CsvSchemaRecord) -> None:
+        """ Parts written before types were recorded are about to be read by `staged`. Refuse, before anything is
+        committed, if that would change a column they hold as numbers or dates into text, or if they don't parse. """
+        inferred = super().scan_asset(asset, kept).collect_schema()
+        retyped = [
+            name for name, spec in staged
+            if name in inferred and inferred[name] != pl.String and self._spec_to_dtype(spec) == pl.String
+        ]
+        problem = f"{retyped} would become text" if retyped else None
+        if problem is None:
+            try:
+                self._scan_recorded(asset, kept, staged).select(pl.all().null_count()).collect(engine="streaming")
+            except (pl.exceptions.PolarsError, ValueError) as error:
+                problem = str(error).splitlines()[0]
+        if problem is not None:
+            raise ValueError(
+                f"asset {asset.name!r} has CSV data written before its types were recorded, which doesn't fit this "
+                f"write's schema ({problem}) - run `repipe clear {asset.name}` first"
+            )
+
+    def replace(self, asset: Asset, run_id: str, partition: PartitionKey | None = None) -> None:
+        """ As `StorageConcrete.replace`, except the record: it is not a part, and an overwrite just wrote it. """
+        directory = self.partition_dir(asset, partition)
+        self._delete_under(directory, keep=lambda path: path.name.startswith(f"run-{run_id}-") or path.name == _CSV_SCHEMA_FILE)
+        self._remove_empty_dirs(directory, stop=self.asset_dir(asset))
+
+    def clear(self, asset: Asset, partition: PartitionKey | None = None) -> None:
+        super().clear(asset, partition)
+        if not self.existing_parts(asset):
+            self.schema_path(asset).unlink(missing_ok=True)
+
+    def schema_path(self, asset: Asset) -> Path:
+        return self.asset_dir(asset) / _CSV_SCHEMA_FILE
+
+    @staticmethod
+    def _dtype_to_spec(dtype: pl.DataType) -> dict[str, Any] | None:
+        """ `None` for a type CSV can't hold (nested, binary, duration, object ...). """
+        for name, simple in _CSV_SIMPLE_DTYPES.items():
+            if dtype == simple:
+                return {"type": name}
+        if isinstance(dtype, pl.Datetime):
+            return {"type": "Datetime", "time_unit": dtype.time_unit, "time_zone": dtype.time_zone}
+        if isinstance(dtype, pl.Enum):
+            return {"type": "Enum", "categories": dtype.categories.to_list()}
+        if isinstance(dtype, pl.Decimal):
+            return {"type": "Decimal", "precision": dtype.precision, "scale": dtype.scale}
+        return None
+
+    @staticmethod
+    def _spec_to_dtype(spec: Mapping[str, Any]) -> pl.DataType:
+        kind = spec["type"]
+        if kind in _CSV_SIMPLE_DTYPES:
+            return _CSV_SIMPLE_DTYPES[kind]
+        if kind == "Datetime":
+            return pl.Datetime(spec["time_unit"], spec["time_zone"])
+        if kind == "Enum":
+            return pl.Enum(spec["categories"])
+        if kind == "Decimal":
+            return pl.Decimal(spec["precision"], spec["scale"])
+        raise ValueError(f"unknown type {kind!r} in a recorded CSV schema")
+
+    @staticmethod
+    def _record_of(asset: Asset, schema: pl.Schema) -> _CsvSchemaRecord:
+        if not schema:
+            raise ValueError(f"asset {asset.name!r} has no columns, which CSV can't store")
+        record: _CsvSchemaRecord = []
+        for name, dtype in schema.items():
+            if '"' in name or name.startswith("\ufeff"):
+                raise ValueError(
+                    f"asset {asset.name!r}'s column {name!r} has a quote or a byte-order mark in its name, which a CSV "
+                    f"header can't hold and read back as it was - rename it"
+                )
+            spec = CsvPolars._dtype_to_spec(dtype)
+            if spec is None:
+                raise TypeError(
+                    f"asset {asset.name!r}'s column {name!r} is {dtype!r}, which CSV can't store - "
+                    f"use Parquet or Arrow, or cast it first"
+                )
+            record.append([name, spec])
+        return record
+
+    @staticmethod
+    def _merge_records(old: _CsvSchemaRecord, new: _CsvSchemaRecord) -> _CsvSchemaRecord | None:
+        """ The one record both fit, or `None`. A column of only nulls has the type `Null`, which says nothing about what it
+        holds, so it fits any other. """
+        if [name for name, _ in old] != [name for name, _ in new]:
+            return None
+        merged: _CsvSchemaRecord = []
+        for (name, before), (_, after) in zip(old, new):
+            if before == after or after["type"] == "Null":
+                merged.append([name, before])
+            elif before["type"] == "Null":
+                merged.append([name, after])
+            else:
+                return None
+        return merged
+
+    @staticmethod
+    def _zones_to_utc(schema: pl.Schema) -> list[pl.Expr]:
+        """ CSV writes a UTC offset as `+HHMM`, which has no room for the seconds some historical zones have (Kolkata's
+        +05:21:10), so the instant is written in UTC and put back in its zone on reading. """
+        return [
+            pl.col(name).dt.convert_time_zone("UTC")
+            for name, dtype in schema.items() if isinstance(dtype, pl.Datetime) and dtype.time_zone is not None
+        ]
+
+    @staticmethod
+    def _describe_schema_change(old: _CsvSchemaRecord, new: _CsvSchemaRecord) -> str:
+        before, after = {name: spec for name, spec in old}, {name: spec for name, spec in new}
+        changes = [f"{name!r} added" for name in after if name not in before]
+        changes += [f"{name!r} removed" for name in before if name not in after]
+        changes += [
+            f"{name!r} was {CsvPolars._spec_to_dtype(before[name])!r}, now {CsvPolars._spec_to_dtype(after[name])!r}"
+            for name in after if name in before and before[name] != after[name]
+        ]
+        return "; ".join(changes) or "the column order changed"
+
+    @staticmethod
+    def _read_record(path: Path) -> _CsvSchemaRecord | None:
+        if not path.is_file():
+            return None
+        stored = json.loads(path.read_text(encoding="utf-8"))
+        if stored.get("version") != _CSV_SCHEMA_VERSION:
+            raise ValueError(f"{path} has schema version {stored.get('version')!r}, but this repipe reads {_CSV_SCHEMA_VERSION}")
+        return stored["columns"]
+
+    @staticmethod
+    def _write_record(path: Path, record: _CsvSchemaRecord) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f"{path.name}.tmp")
+        temporary.write_text(json.dumps({"version": _CSV_SCHEMA_VERSION, "columns": record}, indent=1), encoding="utf-8")
+        os.replace(temporary, path)
+
+    @staticmethod
+    def _parse_recorded(name: str, dtype: pl.DataType) -> pl.Expr:
+        """ A column read as text, as `dtype`. Strict: a value that isn't one fails the read. """
+        column = pl.col(name)
+        if dtype == pl.String:
+            return column
+        if dtype == pl.Boolean:
+            return column.replace_strict({"true": True, "false": False}, return_dtype=pl.Boolean)
+        if dtype == pl.Date:
+            return column.str.to_date("%Y-%m-%d", strict=True)
+        if dtype == pl.Time:
+            return column.str.to_time(strict=True)
+        if isinstance(dtype, pl.Datetime):
+            if dtype.time_zone is None:
+                return column.str.to_datetime(time_unit=dtype.time_unit, strict=True)
+            # written with its UTC offset, so parsed as an instant and then put back in its own zone
+            instant = column.str.to_datetime(time_unit=dtype.time_unit, time_zone="UTC", strict=True)
+            return instant.dt.convert_time_zone(dtype.time_zone)
+        if hasattr(pl, "Float16") and dtype == pl.Float16:
+            return column.cast(pl.Float32, strict=True).cast(pl.Float16)
+        return column.cast(dtype, strict=True)
 
 
 def _parse_text(name: str, dtype: pl.DataType) -> pl.Expr:
