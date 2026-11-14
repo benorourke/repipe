@@ -13,7 +13,7 @@ import warnings
 from abc import abstractmethod
 from collections.abc import Iterator, Mapping, Set as AbstractSet
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, AsyncIterator, Callable, Generator, cast, overload
+from typing import TYPE_CHECKING, Annotated, Any, AsyncIterator, Callable, ClassVar, Generator, Self, cast, overload
 
 import duckdb
 import polars as pl
@@ -33,6 +33,7 @@ class StorageType(enum.StrEnum):
     PARQUET = "PARQUET"
     ARROW = "ARROW"
     LGBM = "LGBM"
+    PICKLE = "PICKLE"
 
 
 class Mode(enum.StrEnum):
@@ -77,34 +78,54 @@ class CsvStorageConfig(BaseStorageConfig):
     pass
 
 
-class LGBMStorageConfig(BaseStorageConfig):
-    """ A trained model has no rows, so none of `BaseStorageConfig`'s part-compaction fields apply. """
+class SingleObjectStorageConfig(BaseStorageConfig):
+    """ One value per asset (or per partition), written whole and replaced whole. It has no rows, so none
+    of `BaseStorageConfig`'s part-compaction fields apply. """
+
+    what: ClassVar[str] = "an object"
+    """ What the asset holds, as it reads in the errors below. """
+    noun: ClassVar[str] = "object"
+    inferred: ClassVar[bool] = False
+    """ Whether a return annotation can select this storage, so that its errors may say it might have been inferred. """
 
     @model_validator(mode="after")
-    def _check_fields_are_compatible_with_a_model(self) -> "LGBMStorageConfig":
+    def _check_fields_are_compatible_with_a_single_value(self) -> Self:
+        name = type(self).__name__
         if self.mode != Mode.OVERWRITE:
             raise ValueError(
-                f"LGBMStorageConfig only supports Mode.OVERWRITE, got {self.mode!r} - "
-                f"a model has no parts to append or merge"
+                f"{name} only supports Mode.OVERWRITE, got {self.mode!r} - "
+                f"{self.what} has no parts to append or merge"
             )
         if self.is_duplicate is not None:
-            raise ValueError("LGBMStorageConfig doesn't support is_duplicate - a model has no rows to dedupe")
+            raise ValueError(f"{name} doesn't support is_duplicate - {self.what} has no rows to dedupe")
         if self.max_rows_per_file is not None:
-            raise ValueError("LGBMStorageConfig doesn't support max_rows_per_file - a model isn't rows")
+            raise ValueError(f"{name} doesn't support max_rows_per_file - {self.what} isn't rows")
         return self
 
     def check_compatible(self, inner_func: Callable[..., Any], partition: PartitionSettings | None) -> None:
-        # A partitioned model asset yields one keyed `Output` per partition, so only an
-        # unpartitioned one has to return a single model.
+        # A partitioned asset yields one keyed `Output` per partition, so only an
+        # unpartitioned one has to return a single value.
         if partition is None and (inspect.isgeneratorfunction(inner_func) or inspect.isasyncgenfunction(inner_func)):
+            how = " (possibly inferred from its return annotation; override with `storage=`)" if self.inferred else ""
             raise ValueError(
-                f"asset {inner_func.__name__!r} is a generator but uses LGBMStorageConfig (possibly "
-                f"inferred from its return annotation; override with `storage=`) - "
-                f"a trained model has no per-chunk parts to write; return a single model instead"
+                f"asset {inner_func.__name__!r} is a generator but uses {type(self).__name__}{how} - "
+                f"{self.what} has no per-chunk parts to write; return a single {self.noun} instead"
             )
 
 
-type StorageConfig = ParquetStorageConfig | ArrowStorageConfig | CsvStorageConfig | LGBMStorageConfig
+class LGBMStorageConfig(SingleObjectStorageConfig):
+    what: ClassVar[str] = "a trained model"
+    noun: ClassVar[str] = "model"
+    inferred: ClassVar[bool] = True
+
+
+class PickleStorageConfig(SingleObjectStorageConfig):
+    """ Any picklable Python object. Never inferred from a return annotation: pass `storage=StorageType.PICKLE`. """
+
+
+type StorageConfig = (
+    ParquetStorageConfig | ArrowStorageConfig | CsvStorageConfig | LGBMStorageConfig | PickleStorageConfig
+)
 
 
 def make_default_storage_config(storage_type: StorageType) -> StorageConfig:
@@ -117,6 +138,8 @@ def make_default_storage_config(storage_type: StorageType) -> StorageConfig:
             return CsvStorageConfig()
         case StorageType.LGBM:
             return LGBMStorageConfig()
+        case StorageType.PICKLE:
+            return PickleStorageConfig()
         case _:
             raise NotImplementedError()
 
@@ -644,27 +667,29 @@ def _parse_text(name: str, dtype: pl.DataType) -> pl.Expr:
     return column.cast(dtype)
 
 
-# LGBM
-class LGBMModelStorage(StorageConcrete[LGBMModel, LGBMModel, LGBMStorageConfig]):
-    """ One pickled model per asset, or per partition. `load` returns the latest one, or for a
-    partitioned asset a dict of the latest per partition. """
+# SINGLE OBJECTS
+class SingleObjectStorage[LoadType, ConfigType: SingleObjectStorageConfig](StorageConcrete[LoadType, Any, ConfigType]):
+    """ One serialised value per asset, or per partition. `load` returns the latest one, or for a
+    partitioned asset a dict of the latest per partition. A format only says how to turn a value into
+    the bytes of a file and back: where it goes, and how a run commits it, is the same for all of them. """
 
-    extension = "pkl"
+    @abstractmethod
+    def serialize(self, config: ConfigType, asset: Asset, obj: Any) -> bytes:
+        """ `obj` as the bytes of one file, as `config` says. Raises an error naming `asset` for anything the format can't hold. """
+        raise NotImplementedError()
 
-    @property
-    def config_type(self) -> type[LGBMStorageConfig]:
-        return LGBMStorageConfig
+    @abstractmethod
+    def deserialize(self, data: bytes) -> Any:
+        raise NotImplementedError()
 
     def stage(
-            self, config: LGBMStorageConfig, asset: Asset, obj: LGBMModel, directory: Path,
+            self, config: ConfigType, asset: Asset, obj: Any, directory: Path,
             chunk_number: int, partition: Mapping[str, Any] | None = None,
     ) -> set[PartitionKey]:
-        if not isinstance(obj, (LGBMClassifier, LGBMRegressor, LGBMRanker)):
-            raise TypeError(
-                f"asset {asset.name!r} returned {type(obj).__name__!r}, but its storage "
-                f"(LGBMModelStorage) only persists a trained LGBM model - pass `storage=` "
-                f"(or, for a plain `@asset`, annotate the return type)"
-            )
+        data = self.serialize(config, asset, obj)
+        if obj is None:
+            # `load_previous` returns None for "nothing written yet", so a stored None couldn't be told apart.
+            raise TypeError(f"asset {asset.name!r} returned None - there is nothing to persist")
 
         settings = asset.settings.partition
         if settings is None:
@@ -673,44 +698,104 @@ class LGBMModelStorage(StorageConcrete[LGBMModel, LGBMModel, LGBMStorageConfig])
             key = None
         elif partition is None:
             raise ValueError(
-                f"asset {asset.name!r} is a partitioned model, so each model needs a key: "
-                f"yield Output(model, partition={{...}})"
+                f"asset {asset.name!r} is partitioned, so each {config.noun} needs a key: "
+                f"yield Output({config.noun}, partition={{...}})"
             )
         else:
             key = PartitionKey.from_mapping(settings, partition)
 
         target = directory / key.relative_path() if key else directory
         target.mkdir(parents=True, exist_ok=True)
-        with (target / self._chunk_name(chunk_number)).open("wb") as file:
-            pickle.dump(obj, file)
+        (target / self._chunk_name(chunk_number)).write_bytes(data)
         return {key} if key else set()
 
-    def load(self, config: LGBMStorageConfig, asset: Asset) -> Any:
+    def load(self, config: ConfigType, asset: Asset) -> Any:
         loaded = self.load_previous(config, asset)
         if loaded is None:
-            raise FileNotFoundError(f"no model has been written yet for asset {asset.name!r}")
+            raise FileNotFoundError(f"no {config.noun} has been written yet for asset {asset.name!r}")
         return loaded
 
-    def load_previous(self, config: LGBMStorageConfig, asset: Asset) -> Any:
+    def load_previous(self, config: ConfigType, asset: Asset) -> Any:
         if asset.settings.partition is None:
             parts = sorted(self.existing_parts(asset))
-            return self._unpickle(parts[-1]) if parts else None
-        models = {
-            key: self._unpickle(sorted(self.existing_parts(asset, key))[-1])
+            return self._read(asset, parts[-1]) if parts else None
+        values = {
+            key: self._read(asset, sorted(self.existing_parts(asset, key))[-1])
             for key in self.existing_partitions(asset)
         }
-        return models or None
+        return values or None
 
-    @staticmethod
-    def _unpickle(path: Path) -> LGBMModel:
-        with path.open("rb") as file:
-            return pickle.load(file)
+    def _read(self, asset: Asset, path: Path) -> Any:
+        try:
+            return self.deserialize(path.read_bytes())
+        except Exception as error:
+            raise RuntimeError(
+                f"asset {asset.name!r}'s file {path} can't be read back ({type(error).__name__}: {error}) - "
+                f"if it can't be recovered, `repipe clear {asset.name}` deletes it"
+            ) from error
 
-    def consolidate(self, config: LGBMStorageConfig, asset: Asset, partition: PartitionKey | None = None) -> None:
+    def consolidate(self, config: ConfigType, asset: Asset, partition: PartitionKey | None = None) -> None:
         raise NotImplementedError(
-            "a model has no parts to compact - LGBMStorageConfig only supports Mode.OVERWRITE, "
-            "which never calls consolidate()"
+            f"{config.what} has no parts to compact - {type(config).__name__} only supports Mode.OVERWRITE, "
+            f"which never calls consolidate()"
         )
+
+
+# LGBM
+class LGBMModelStorage(SingleObjectStorage[LGBMModel, LGBMStorageConfig]):
+    """ A pickled model. """
+
+    extension = "pkl"
+
+    @property
+    def config_type(self) -> type[LGBMStorageConfig]:
+        return LGBMStorageConfig
+
+    def serialize(self, config: LGBMStorageConfig, asset: Asset, obj: Any) -> bytes:
+        if not isinstance(obj, (LGBMClassifier, LGBMRegressor, LGBMRanker)):
+            raise TypeError(
+                f"asset {asset.name!r} returned {type(obj).__name__!r}, but its storage "
+                f"(LGBMModelStorage) only persists a trained LGBM model - pass `storage=` "
+                f"(or, for a plain `@asset`, annotate the return type)"
+            )
+        return pickle.dumps(obj)
+
+    def deserialize(self, data: bytes) -> LGBMModel:
+        return pickle.loads(data)
+
+
+# PICKLE
+class PickleStorage(SingleObjectStorage[Any, PickleStorageConfig]):
+    """ Any object that pickles and unpickles again. Loading unpickles every `*.pkl` in the asset's directory, which
+    runs whatever they say to, so anyone who can write to the storage path can run code: only point repipe at a
+    directory you trust. A pickled class is stored by reference, so renaming or moving it makes the file unreadable. """
+
+    extension = "pkl"
+
+    @property
+    def config_type(self) -> type[PickleStorageConfig]:
+        return PickleStorageConfig
+
+    def serialize(self, config: PickleStorageConfig, asset: Asset, obj: Any) -> bytes:
+        try:
+            data = pickle.dumps(obj)
+        except Exception as error:  # which one depends on the Python version and the object (`__reduce__` is the user's)
+            raise TypeError(
+                f"asset {asset.name!r} returned a {type(obj).__name__!r} that can't be pickled: {error}"
+            ) from error
+        try:
+            pickle.loads(data)
+        except Exception as error:
+            # An exception class whose __init__ takes more than it passes to super() is one: it would be written and
+            # then fail every load.
+            raise TypeError(
+                f"asset {asset.name!r} returned a {type(obj).__name__!r} that pickles but can't be unpickled "
+                f"again ({type(error).__name__}: {error})"
+            ) from error
+        return data
+
+    def deserialize(self, data: bytes) -> Any:
+        return pickle.loads(data)
 
 
 STORAGE_TYPE_MAPPINGS = {
@@ -718,6 +803,7 @@ STORAGE_TYPE_MAPPINGS = {
     StorageType.ARROW: ArrowPolars,
     StorageType.CSV: CsvPolars,
     StorageType.LGBM: LGBMModelStorage,
+    StorageType.PICKLE: PickleStorage,
 }
 
 CONFIG_TYPE_MAPPINGS = {
@@ -725,6 +811,7 @@ CONFIG_TYPE_MAPPINGS = {
     ArrowStorageConfig: StorageType.ARROW,
     CsvStorageConfig: StorageType.CSV,
     LGBMStorageConfig: StorageType.LGBM,
+    PickleStorageConfig: StorageType.PICKLE,
 }
 
 
@@ -736,6 +823,8 @@ def get_storage_concrete(config: ArrowStorageConfig) -> ArrowPolars: ...
 def get_storage_concrete(config: CsvStorageConfig) -> CsvPolars: ...
 @overload
 def get_storage_concrete(config: LGBMStorageConfig) -> LGBMModelStorage: ...
+@overload
+def get_storage_concrete(config: PickleStorageConfig) -> PickleStorage: ...
 @overload
 def get_storage_concrete(config: StorageConfig) -> StorageConcrete[Any, Any, Any]: ...
 

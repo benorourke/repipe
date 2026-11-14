@@ -4,7 +4,7 @@ import types
 import typing
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Coroutine, Iterable, Iterator, Mapping, Sequence, cast, overload
+from typing import Any, AsyncIterator, Callable, Coroutine, Iterable, Iterator, Literal, Mapping, Sequence, cast, overload
 
 import duckdb
 import polars as pl
@@ -13,8 +13,9 @@ from pydantic import BaseModel, field_validator, model_validator
 from repipe.asset.partition import PartitionSettings
 from repipe.storage import (
     LGBMModel,
-    LGBMStorageConfig,
     Mode,
+    PickleStorageConfig,
+    SingleObjectStorageConfig,
     StorageType,
     StorageConfig,
     resolve_storage_config,
@@ -30,7 +31,8 @@ class Output:
     a multi-asset it's for, and/or which partition it's for. Required whenever either applies -
     nothing about the data itself can say it (a model has no columns to read a key from, and a
     dict key can only name one of asset/partition, not both). """
-    data: AssetData
+    data: Any
+    """ Anything the asset's storage persists: a frame or a model, or for `StorageType.PICKLE` any object. """
     asset: str | None = None
     partition: Mapping[str, Any] | None = None
 
@@ -79,9 +81,11 @@ class AssetSettings(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def _check_primary_key_incompatible_with_lgbm(self) -> "AssetSettings":
-        if isinstance(self.storage, LGBMStorageConfig) and self.primary_key is not None:
-            raise ValueError("primary_key has no meaning for LGBMStorageConfig - a model has no rows to key by")
+    def _check_primary_key_incompatible_with_a_single_value(self) -> "AssetSettings":
+        if isinstance(self.storage, SingleObjectStorageConfig) and self.primary_key is not None:
+            raise ValueError(
+                f"primary_key has no meaning for {type(self.storage).__name__} - {self.storage.what} has no rows to key by"
+            )
         return self
 
 
@@ -171,6 +175,24 @@ class RegisteredAssetFunction(BaseModel):
 def asset(func: AssetFunc) -> AssetFunc: ...
 
 
+type AnyFunc = Callable[..., Any]
+
+
+@overload
+def asset(
+        func: None = None,
+        *,
+        storage: PickleStorageConfig | Literal[StorageType.PICKLE],
+        primary_key: PrimaryKey | None = None,
+        schemas: list[str] | None = None,
+        dependencies: list[str] | list[Dependency] | None = None,
+        labels: Sequence[str] | None = None,
+        partition: PartitionSettings | None = None,
+        tests: Sequence[DataQualityTest] | None = None,
+) -> Callable[[AnyFunc], AnyFunc]:
+    """ A pickle asset can return any object, so its return annotation isn't held to `AssetReturnType`. """
+
+
 @overload
 def asset(
         func: None = None,
@@ -195,8 +217,8 @@ def asset(
         labels: Sequence[str] | None = None,
         partition: PartitionSettings | None = None,
         tests: Sequence[DataQualityTest] | None = None,
-) -> AssetFunc | Callable[[AssetFunc], AssetFunc]:
-    """ Supports both bare `@asset` and parameterized `@asset(...)` usage - the two `@overload`s
+) -> Any:
+    """ Supports both bare `@asset` and parameterized `@asset(...)` usage - the `@overload`s
     above exist only so a type checker picks the right return type for each form. """
 
     def decorator(inner_func: AssetFunc) -> AssetFunc:
