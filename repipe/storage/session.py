@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from repipe.asset.partition import PartitionKey
-from repipe.storage.storage import Mode, get_storage_concrete, staging_dir
+from repipe.storage.storage import Mode, SingleObjectStorageConfig, get_storage_concrete, staging_dir
 
 if TYPE_CHECKING:
     from repipe.asset.asset import Asset
@@ -62,6 +62,13 @@ class WriteSession:
                     raise ValueError(f"asset function didn't write its required output {asset.name!r}")
                 continue
             config = asset.settings.storage
+            if isinstance(config, SingleObjectStorageConfig) and asset.settings.partition is None:
+                # An empty commit would delete the previous value. The usual cause is an empty list or tuple, which a
+                # bare return reads as "no Outputs" - and is a perfectly good value to store.
+                raise ValueError(
+                    f"asset {asset.name!r} wrote nothing, so there is no {config.noun} to keep and the previous one "
+                    f"would be deleted - an empty list or tuple is read as 'no Outputs': return Output([]) to store one"
+                )
             get_storage_concrete(config).commit(config, asset, self.root / asset.name, self.run_id, set())
         self.abort()
 
