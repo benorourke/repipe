@@ -621,13 +621,33 @@ def _with_key_columns(asset: Asset, lf: pl.LazyFrame, key: PartitionKey) -> pl.L
     return lf
 
 
+def _scan_files(
+    scan: Callable[[Path | list[Path]], pl.LazyFrame],
+    read_schema: Callable[[Path], Mapping[str, pl.DataType]],
+    source: Path | list[Path],
+) -> pl.LazyFrame:
+    """ `scan(source)`, or - when the files `source` names don't all have the same columns and types - one scan per file,
+    stacked by column name. A plain scan takes its schema from the first file and fails on a later file with another
+    one, which is what an asset's stored files look like once its output gains (or changes) a column. Stacked, a column
+    a file lacks is null for that file's rows, none is dropped, and a column whose type differs between files is widened
+    to one both fit. Files with one schema (the usual case) are scanned together, as they always were. """
+    files = sorted(Path(path) for path in (glob.glob(str(source)) if isinstance(source, Path) else source))
+    if len(files) < 2 or len({frozenset(read_schema(file).items()) for file in files}) == 1:
+        return scan(source)
+    return pl.concat([scan([file]) for file in files], how="diagonal_relaxed")
+
+
 # PARQUET
 class ParquetPolars(PolarsPartitionedStorage[ParquetStorageConfig]):
     extension = "parquet"
 
     def scan(self, source: Path | list[Path], hive_schema: dict[str, pl.DataType] | None) -> pl.LazyFrame:
         # Polars only turns hive on by itself for a bare directory, not a glob or a list of files.
-        return pl.scan_parquet(source, hive_partitioning=hive_schema is not None, hive_schema=hive_schema)
+        return _scan_files(
+            lambda files: pl.scan_parquet(files, hive_partitioning=hive_schema is not None, hive_schema=hive_schema),
+            lambda file: pl.read_parquet_schema(file),
+            source,
+        )
 
     def write(self, df: pl.DataFrame, path: Path) -> None:
         df.write_parquet(path)
@@ -645,7 +665,11 @@ class ArrowPolars(PolarsPartitionedStorage[ArrowStorageConfig]):
     extension = "arrow"  # TODO is this the right extension?
 
     def scan(self, source: Path | list[Path], hive_schema: dict[str, pl.DataType] | None) -> pl.LazyFrame:
-        return pl.scan_ipc(source, hive_partitioning=hive_schema is not None, hive_schema=hive_schema)
+        return _scan_files(
+            lambda files: pl.scan_ipc(files, hive_partitioning=hive_schema is not None, hive_schema=hive_schema),
+            lambda file: pl.read_ipc_schema(file),
+            source,
+        )
 
     def write(self, df: pl.DataFrame, path: Path) -> None:
         df.write_ipc(path)
