@@ -7,6 +7,7 @@ import glob
 import inspect
 import itertools
 import json
+import math
 import os
 import pickle
 import types
@@ -21,7 +22,7 @@ from typing import TYPE_CHECKING, Annotated, Any, AsyncIterator, Callable, Class
 import duckdb
 import polars as pl
 from lightgbm import LGBMClassifier, LGBMRanker, LGBMRegressor
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, StrictInt, model_validator
 
 from repipe.asset.partition import PartitionKey, PartitionSettings
 
@@ -37,6 +38,7 @@ class StorageType(enum.StrEnum):
     ARROW = "ARROW"
     LGBM = "LGBM"
     PICKLE = "PICKLE"
+    JSON = "JSON"
 
 
 class Mode(enum.StrEnum):
@@ -127,8 +129,18 @@ class PickleStorageConfig(SingleObjectStorageConfig):
     """ Any picklable Python object. Never inferred from a return annotation: pass `storage=StorageType.PICKLE`. """
 
 
+class JsonStorageConfig(SingleObjectStorageConfig):
+    """ A value made of JSON's own types: a dict with string keys, list, str, int, float, bool or None, nested to
+    any depth. Never inferred from a return annotation: pass `storage=StorageType.JSON`. """
+
+    indent: Annotated[StrictInt, Field(ge=0)] | None = 2
+    """ `None` writes it on one line. """
+    sort_keys: bool = False
+
+
 type StorageConfig = (
     ParquetStorageConfig | ArrowStorageConfig | CsvStorageConfig | LGBMStorageConfig | PickleStorageConfig
+    | JsonStorageConfig
 )
 
 
@@ -144,6 +156,8 @@ def make_default_storage_config(storage_type: StorageType) -> StorageConfig:
             return LGBMStorageConfig()
         case StorageType.PICKLE:
             return PickleStorageConfig()
+        case StorageType.JSON:
+            return JsonStorageConfig()
         case _:
             raise NotImplementedError()
 
@@ -1077,12 +1091,171 @@ class PickleStorage(SingleObjectStorage[Any, PickleStorageConfig]):
         return pickle.loads(data)
 
 
+# JSON
+class JsonStorage(SingleObjectStorage[Any, JsonStorageConfig]):
+    """ A value of JSON's own types, read back as exactly what was written. `json` would quietly store a tuple as a list,
+    an int key as a string, a str subclass as a str and a `NaN` as a token that isn't JSON, so each of those, and
+    anything else but the JSON types, is an error instead. """
+
+    extension = "json"
+
+    _LEAVE = object()
+    """ Pushed after a container's children, to say it is no longer one of the values being walked through. """
+
+    @property
+    def config_type(self) -> type[JsonStorageConfig]:
+        return JsonStorageConfig
+
+    def serialize(self, config: JsonStorageConfig, asset: Asset, obj: Any) -> bytes:
+        self._check_native(asset, obj)
+        try:
+            text = json.dumps(obj, indent=config.indent, sort_keys=config.sort_keys, ensure_ascii=False, allow_nan=False)
+        except RecursionError as error:  # json recurses, so a value nested deeper than the interpreter allows can't be written
+            raise ValueError(f"asset {asset.name!r}'s value is nested too deeply to write as JSON") from error
+        return (text + "\n").encode("utf-8")
+
+    def deserialize(self, data: bytes) -> Any:
+        value = json.loads(data, parse_float=self._parse_finite_float, parse_constant=self._reject_constant)
+        if value is None:
+            raise ValueError("the file holds null, which is never written here")
+        return value
+
+    @staticmethod
+    def _check_native(asset: Asset, root: Any) -> None:
+        """ Raises, naming `asset` and where in the value, for anything JSON can't hold as it is: only exactly `dict`,
+        `list`, `str`, `int`, `float`, `bool` and `None` pass. Walks with a stack of its own, so how deep a value may go
+        is not limited by the interpreter's, and only builds a path to report one. """
+        check_value, check_text, path, type_name = (
+            JsonStorage._check_value, JsonStorage._check_text, JsonStorage._path, JsonStorage._type_name
+        )
+        active: set[int] = set()  # the containers between the root and the one being looked at, to find one inside itself
+        stack: list[tuple[Any, Any]] = []
+        check_value(asset, root, None, stack)
+        while stack:
+            container, where = stack.pop()
+            if container is JsonStorage._LEAVE:
+                active.discard(where)  # `where` is the container's id
+                continue
+            if id(container) in active:
+                raise ValueError(f"asset {asset.name!r}'s value refers back to itself at {path(where)}")
+            active.add(id(container))
+            stack.append((JsonStorage._LEAVE, id(container)))
+
+            is_dict = type(container) is dict
+            pending: list[tuple[Any, Any]] = []
+            for key, item in (container.items() if is_dict else enumerate(container)):
+                if is_dict:
+                    if type(key) is not str:
+                        note = " (a str subclass would load back as a plain str)" if isinstance(key, str) else ""
+                        raise TypeError(
+                            f"asset {asset.name!r}'s value has the {type_name(key)!r} key {key!r} at {path(where)}, "
+                            f"but JSON keys are strings - convert it to a str{note}"
+                        )
+                    if not key.isascii():
+                        check_text(asset, key, (where, key))
+                # What nearly every value is, settled here rather than in a call
+                kind = type(item)
+                if kind is str:
+                    if item.isascii():
+                        continue
+                elif kind is float:
+                    if item - item == 0:  # not NaN or infinite
+                        continue
+                elif kind is bool or item is None or (kind is int and item.bit_length() <= 4000):
+                    continue
+                check_value(asset, item, (where, key), pending)
+            stack.extend(reversed(pending))  # so they are walked in order
+
+    @staticmethod
+    def _check_value(asset: Asset, value: Any, where: Any, containers: list[tuple[Any, Any]]) -> None:
+        """ Checks one value, and adds it to `containers` if it is one to look inside. """
+        kind = type(value)
+        if value is None or kind is bool:
+            return
+        if kind is str:
+            JsonStorage._check_text(asset, value, where)
+        elif kind is int:
+            if value.bit_length() > 4000:  # only a very long one can reach the interpreter's limit on digits
+                try:
+                    str(value)
+                except ValueError as error:
+                    raise ValueError(
+                        f"asset {asset.name!r}'s value has an integer at {JsonStorage._path(where)} that is too long "
+                        f"for this interpreter to write ({error})"
+                    ) from error
+        elif kind is float:
+            if not math.isfinite(value):
+                raise ValueError(
+                    f"asset {asset.name!r}'s value has {value!r} at {JsonStorage._path(where)}, which isn't valid JSON"
+                )
+        elif kind is list or kind is dict:
+            containers.append((value, where))
+        else:
+            raise JsonStorage._unsupported(asset, value, where)
+
+    @staticmethod
+    def _check_text(asset: Asset, text: str, where: Any) -> None:
+        if text.isascii():
+            return
+        try:
+            text.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise ValueError(
+                f"asset {asset.name!r}'s value has a string at {JsonStorage._path(where)} with the lone surrogate "
+                f"{error.object[error.start]!r}, which can't be written as UTF-8"
+            ) from error
+
+    @staticmethod
+    def _unsupported(asset: Asset, value: Any, where: Any) -> TypeError:
+        if isinstance(value, tuple):
+            hint = "use a list"
+        else:
+            base = next((base for base in (str, int, float, list, dict) if isinstance(value, base)), None)
+            hint = (
+                f"it is a subclass of {base.__name__}, which would load back as a plain {base.__name__} - convert it first"
+                if base is not None else "convert it to a str, number, bool, None, list or dict"
+            )
+        return TypeError(
+            f"asset {asset.name!r}'s value has a {JsonStorage._type_name(value)!r} at {JsonStorage._path(where)}, "
+            f"which JSON can't store - {hint}"
+        )
+
+    @staticmethod
+    def _type_name(value: Any) -> str:
+        kind = type(value)
+        return kind.__name__ if kind.__module__ == "builtins" else f"{kind.__module__}.{kind.__qualname__}"
+
+    @staticmethod
+    def _path(where: Any) -> str:
+        """ `$.rates[1]`, from the `(parent, key)` links the walk keeps instead of building a string for every value. """
+        keys = []
+        while where is not None:
+            where, key = where
+            keys.append(key)
+        return "$" + "".join(
+            f"[{key}]" if isinstance(key, int) else f".{key}" if key.isidentifier() else f"[{key!r}]"
+            for key in reversed(keys)
+        )
+
+    @staticmethod
+    def _parse_finite_float(text: str) -> float:
+        value = float(text)
+        if not math.isfinite(value):  # 1e999 is valid JSON that Python reads as infinity
+            raise ValueError(f"{text} doesn't fit in a float")
+        return value
+
+    @staticmethod
+    def _reject_constant(name: str) -> Any:
+        raise ValueError(f"{name} isn't valid JSON")
+
+
 STORAGE_TYPE_MAPPINGS = {
     StorageType.PARQUET: ParquetPolars,
     StorageType.ARROW: ArrowPolars,
     StorageType.CSV: CsvPolars,
     StorageType.LGBM: LGBMModelStorage,
     StorageType.PICKLE: PickleStorage,
+    StorageType.JSON: JsonStorage,
 }
 
 CONFIG_TYPE_MAPPINGS = {
@@ -1091,6 +1264,7 @@ CONFIG_TYPE_MAPPINGS = {
     CsvStorageConfig: StorageType.CSV,
     LGBMStorageConfig: StorageType.LGBM,
     PickleStorageConfig: StorageType.PICKLE,
+    JsonStorageConfig: StorageType.JSON,
 }
 
 
@@ -1104,6 +1278,8 @@ def get_storage_concrete(config: CsvStorageConfig) -> CsvPolars: ...
 def get_storage_concrete(config: LGBMStorageConfig) -> LGBMModelStorage: ...
 @overload
 def get_storage_concrete(config: PickleStorageConfig) -> PickleStorage: ...
+@overload
+def get_storage_concrete(config: JsonStorageConfig) -> JsonStorage: ...
 @overload
 def get_storage_concrete(config: StorageConfig) -> StorageConcrete[Any, Any, Any]: ...
 

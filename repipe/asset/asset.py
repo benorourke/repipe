@@ -12,6 +12,7 @@ from pydantic import BaseModel, field_validator, model_validator
 
 from repipe.asset.partition import PartitionSettings
 from repipe.storage import (
+    JsonStorageConfig,
     LGBMModel,
     Mode,
     PickleStorageConfig,
@@ -182,7 +183,7 @@ type AnyFunc = Callable[..., Any]
 def asset(
         func: None = None,
         *,
-        storage: PickleStorageConfig | Literal[StorageType.PICKLE],
+        storage: PickleStorageConfig | JsonStorageConfig | Literal[StorageType.PICKLE, StorageType.JSON],
         primary_key: PrimaryKey | None = None,
         schemas: list[str] | None = None,
         dependencies: list[str] | list[Dependency] | None = None,
@@ -190,7 +191,7 @@ def asset(
         partition: PartitionSettings | None = None,
         tests: Sequence[DataQualityTest] | None = None,
 ) -> Callable[[AnyFunc], AnyFunc]:
-    """ A pickle asset can return any object, so its return annotation isn't held to `AssetReturnType`. """
+    """ A pickle or JSON asset can return any value, so its return annotation isn't held to `AssetReturnType`. """
 
 
 @overload
